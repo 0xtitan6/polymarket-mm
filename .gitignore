@@ -1,0 +1,40 @@
+# Binaries
+/bot
+*.exe
+*.dll
+*.so
+*.dylib
+
+# Test binaries
+*.test
+*.out
+
+# Go workspace file
+go.work
+
+# Dependency directories
+vendor/
+
+# Sensitive data
+*.log
+bot.log
+
+# Data directory - contains position files
+/data/*
+!data/.gitkeep
+
+# Environment files
+.env
+.env.local
+.env.*.local
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS files
+.DS_Store
+Thumbs.db

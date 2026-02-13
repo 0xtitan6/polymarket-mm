@@ -1,0 +1,54 @@
+dry_run: true  # if true, no real orders will be placed
+
+wallet:
+  private_key: ""           # set via POLY_PRIVATE_KEY env
+  signature_type: 1         # 0=EOA, 1=POLY_PROXY, 2=GNOSIS_SAFE
+  funder_address: ""        # set via config or env - your proxy wallet address from polymarket.com/settings
+  chain_id: 137             # Polygon mainnet
+
+api:
+  clob_base_url: "https://clob.polymarket.com"
+  gamma_base_url: "https://gamma-api.polymarket.com"
+  ws_market_url: "wss://ws-subscriptions-clob.polymarket.com/ws/market"
+  ws_user_url: "wss://ws-subscriptions-clob.polymarket.com/ws/user"
+  api_key: ""               # set via POLY_API_KEY env
+  secret: ""                # set via POLY_API_SECRET env
+  passphrase: ""            # set via POLY_PASSPHRASE env
+
+strategy:
+  gamma: 0.1                # risk aversion (higher = tighter inventory control)
+  sigma: 0.5                # annualized vol estimate
+  k: 1.5                    # order arrival intensity
+  t: 0.00274                # time horizon (~1 day in years = 1/365)
+  default_spread_bps: 200   # 2% minimum spread
+  order_size_usd: 1.0       # quote size per side in USDC (minimal for testing)
+  refresh_interval: 5s      # how often to re-quote
+  stale_book_timeout: 30s   # cancel quotes if no book update
+
+risk:
+  max_position_per_market: 10.0
+  max_global_exposure: 20.0
+  max_markets_active: 1
+  kill_switch_drop_pct: 0.15   # 15% price move triggers kill
+  kill_switch_window_sec: 60
+  max_daily_loss: 5.0
+  cooldown_after_kill: 5m
+
+scanner:
+  poll_interval: 60s
+  min_liquidity: 1.0         # $1 minimum liquidity for tiny markets
+  min_volume_24h: 1.0        # $1 minimum volume
+  min_spread: 0.001          # 0.1% minimum spread
+  max_end_date_days: 1       # Only today's markets
+  exclude_slugs: []
+
+store:
+  data_dir: "./data"
+
+logging:
+  level: "info"
+  format: "json"
+
+dashboard:
+  enabled: true
+  port: 8080
