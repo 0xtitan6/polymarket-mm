@@ -261,3 +261,28 @@ func TestIsKillSwitchCooldown(t *testing.T) {
 		t.Error("kill switch should expire after cooldown")
 	}
 }
+
+func TestRemoveMarketRecomputesTotals(t *testing.T) {
+	t.Parallel()
+	rm := newTestManager()
+
+	now := time.Now()
+	rm.processReport(PositionReport{MarketID: "m1", ExposureUSD: 60, RealizedPnL: 5, MidPrice: 0.50, Timestamp: now})
+	rm.processReport(PositionReport{MarketID: "m2", ExposureUSD: 70, RealizedPnL: 3, MidPrice: 0.50, Timestamp: now})
+
+	if got := rm.totalExposure; got != 130 {
+		t.Fatalf("totalExposure before remove = %v, want 130", got)
+	}
+	if got := rm.totalRealizedPnL; got != 8 {
+		t.Fatalf("totalRealizedPnL before remove = %v, want 8", got)
+	}
+
+	rm.RemoveMarket("m2")
+
+	if got := rm.totalExposure; got != 60 {
+		t.Fatalf("totalExposure after remove = %v, want 60", got)
+	}
+	if got := rm.totalRealizedPnL; got != 5 {
+		t.Fatalf("totalRealizedPnL after remove = %v, want 5", got)
+	}
+}

@@ -122,6 +122,7 @@ func (rm *Manager) RemoveMarket(marketID string) {
 
 	delete(rm.positions, marketID)
 	delete(rm.priceAnchors, marketID)
+	rm.recomputeTotalsLocked()
 }
 
 // IsKillSwitchActive returns whether the kill switch is engaged.
@@ -226,15 +227,7 @@ func (rm *Manager) processReport(report PositionReport) {
 
 	rm.positions[report.MarketID] = report
 
-	// Recalculate totals
-	rm.totalExposure = 0
-	rm.totalRealizedPnL = 0
-	totalUnrealizedPnL := 0.0
-	for _, pos := range rm.positions {
-		rm.totalExposure += pos.ExposureUSD
-		rm.totalRealizedPnL += pos.RealizedPnL
-		totalUnrealizedPnL += pos.UnrealizedPnL
-	}
+	totalUnrealizedPnL := rm.recomputeTotalsLocked()
 
 	// Check per-market limit
 	if report.ExposureUSD > rm.cfg.MaxPositionPerMarket {
@@ -255,6 +248,18 @@ func (rm *Manager) processReport(report PositionReport) {
 	// Check rapid price movement (kill switch)
 	rm.checkPriceMovement(report)
 
+}
+
+func (rm *Manager) recomputeTotalsLocked() float64 {
+	rm.totalExposure = 0
+	rm.totalRealizedPnL = 0
+	totalUnrealizedPnL := 0.0
+	for _, pos := range rm.positions {
+		rm.totalExposure += pos.ExposureUSD
+		rm.totalRealizedPnL += pos.RealizedPnL
+		totalUnrealizedPnL += pos.UnrealizedPnL
+	}
+	return totalUnrealizedPnL
 }
 
 // checkPriceMovement detects rapid price swings using a rolling anchor.
@@ -326,4 +331,3 @@ func (rm *Manager) emitKill(marketID, reason string) {
 		rm.killCh <- sig
 	}
 }
-

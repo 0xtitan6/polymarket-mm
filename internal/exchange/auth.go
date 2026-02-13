@@ -39,11 +39,11 @@ type Credentials struct {
 // The funderAddress may differ from address when using a proxy/multisig wallet.
 type Auth struct {
 	privateKey    *ecdsa.PrivateKey   // EOA private key for L1 signing
-	address       common.Address     // EOA address derived from privateKey
-	funderAddress common.Address     // proxy/funder wallet (== address if no proxy)
-	chainID       *big.Int           // Polygon chain ID (137 mainnet, 80002 amoy)
+	address       common.Address      // EOA address derived from privateKey
+	funderAddress common.Address      // proxy/funder wallet (== address if no proxy)
+	chainID       *big.Int            // Polygon chain ID (137 mainnet, 80002 amoy)
 	sigType       types.SignatureType // 0 = EOA
-	creds         Credentials        // L2 API credentials (derived or configured)
+	creds         Credentials         // L2 API credentials (derived or configured)
 }
 
 // NewAuth creates an Auth instance from config.
@@ -85,6 +85,11 @@ func NewAuth(cfg config.Config) (*Auth, error) {
 // Address returns the signer's Ethereum address.
 func (a *Auth) Address() common.Address {
 	return a.address
+}
+
+// ChainID returns the configured chain ID.
+func (a *Auth) ChainID() *big.Int {
+	return a.chainID
 }
 
 // FunderAddress returns the funder/proxy wallet address.
@@ -148,8 +153,13 @@ func (a *Auth) WSAuthPayload() *types.WSAuth {
 
 // signClobAuth produces an EIP-712 signature for L1 authentication.
 func (a *Auth) signClobAuth(timestamp string, nonce int) (string, error) {
-	typedData := apitypes.TypedData{
-		Types: apitypes.Types{
+	sig, err := a.SignTypedData(
+		&apitypes.TypedDataDomain{
+			Name:    "ClobAuthDomain",
+			Version: "1",
+			ChainId: (*ethmath.HexOrDecimal256)(new(big.Int).Set(a.chainID)),
+		},
+		apitypes.Types{
 			"EIP712Domain": {
 				{Name: "name", Type: "string"},
 				{Name: "version", Type: "string"},
@@ -162,48 +172,71 @@ func (a *Auth) signClobAuth(timestamp string, nonce int) (string, error) {
 				{Name: "message", Type: "string"},
 			},
 		},
-		PrimaryType: "ClobAuth",
-		Domain: apitypes.TypedDataDomain{
-			Name:    "ClobAuthDomain",
-			Version: "1",
-			ChainId: (*ethmath.HexOrDecimal256)(new(big.Int).Set(a.chainID)),
-		},
-		Message: apitypes.TypedDataMessage{
+		apitypes.TypedDataMessage{
 			"address":   a.address.Hex(),
 			"timestamp": timestamp,
 			"nonce":     fmt.Sprintf("%d", nonce),
 			"message":   "This message attests that I control the given wallet",
 		},
-	}
-
-	hash, _, err := apitypes.TypedDataAndHash(typedData)
-	if err != nil {
-		return "", fmt.Errorf("typed data hash: %w", err)
-	}
-
-	sig, err := crypto.Sign(hash, a.privateKey)
+		"ClobAuth",
+	)
 	if err != nil {
 		return "", fmt.Errorf("sign: %w", err)
-	}
-
-	// Adjust V value: go-ethereum returns 0/1, EIP-712 expects 27/28
-	if sig[64] < 27 {
-		sig[64] += 27
 	}
 
 	return "0x" + common.Bytes2Hex(sig), nil
 }
 
+// SignTypedData signs EIP-712 typed data and adjusts V to 27/28.
+func (a *Auth) SignTypedData(
+	domain *apitypes.TypedDataDomain,
+	typesDef apitypes.Types,
+	message apitypes.TypedDataMessage,
+	primaryType string,
+) ([]byte, error) {
+	typedData := apitypes.TypedData{
+		Types:       typesDef,
+		PrimaryType: primaryType,
+		Domain:      *domain,
+		Message:     message,
+	}
+
+	hash, _, err := apitypes.TypedDataAndHash(typedData)
+	if err != nil {
+		return nil, fmt.Errorf("typed data hash: %w", err)
+	}
+
+	sig, err := crypto.Sign(hash, a.privateKey)
+	if err != nil {
+		return nil, fmt.Errorf("sign typed data: %w", err)
+	}
+
+	if sig[64] < 27 {
+		sig[64] += 27
+	}
+	return sig, nil
+}
+
 // buildHMAC computes the HMAC-SHA256 signature for L2 auth.
 // message = timestamp + method + requestPath [+ body]
 func (a *Auth) buildHMAC(timestamp, method, path, body string) (string, error) {
-	secretBytes, err := base64.URLEncoding.DecodeString(a.creds.Secret)
-	if err != nil {
-		// Try standard base64 if URL encoding fails
-		secretBytes, err = base64.StdEncoding.DecodeString(a.creds.Secret)
-		if err != nil {
-			return "", fmt.Errorf("decode secret: %w", err)
+	decoders := []*base64.Encoding{
+		base64.URLEncoding,
+		base64.RawURLEncoding,
+		base64.StdEncoding,
+		base64.RawStdEncoding,
+	}
+
+	var secretBytes []byte
+	var err error
+	for _, dec := range decoders {
+		secretBytes, err = dec.DecodeString(a.creds.Secret)
+		if err == nil {
+			break
 		}
+	}
+	if err != nil {
+		return "", fmt.Errorf("decode secret: %w", err)
 	}
 
 	message := timestamp + method + path

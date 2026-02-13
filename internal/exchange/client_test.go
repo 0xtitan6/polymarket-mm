@@ -4,6 +4,7 @@ import (
 	"context"
 	"log/slog"
 	"os"
+	"strings"
 	"testing"
 
 	"polymarket-mm/internal/config"
@@ -124,5 +125,86 @@ func TestNewClientDryRunFromConfig(t *testing.T) {
 
 	if !c.dryRun {
 		t.Error("client.dryRun should be true when config.DryRun is true")
+	}
+}
+
+func TestBuildOrderPayloadSignsOrder(t *testing.T) {
+	t.Parallel()
+
+	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelError}))
+	cfg := config.Config{
+		Wallet: config.WalletConfig{
+			PrivateKey:    "0x1111111111111111111111111111111111111111111111111111111111111111",
+			ChainID:       137,
+			SignatureType: 0,
+		},
+		API: config.APIConfig{
+			CLOBBaseURL: "http://localhost",
+			ApiKey:      "test-key",
+			Secret:      "test-secret",
+			Passphrase:  "test-pass",
+		},
+	}
+
+	auth, err := NewAuth(cfg)
+	if err != nil {
+		t.Fatalf("NewAuth: %v", err)
+	}
+
+	c := NewClient(cfg, auth, logger)
+	payload, err := c.buildOrderPayload(types.UserOrder{
+		TokenID:   "12345678901234567890",
+		Price:     0.55,
+		Size:      10,
+		Side:      types.BUY,
+		OrderType: types.OrderTypeGTC,
+		TickSize:  types.Tick001,
+	})
+	if err != nil {
+		t.Fatalf("buildOrderPayload: %v", err)
+	}
+
+	if payload.Order.Signature == "" || !strings.HasPrefix(payload.Order.Signature, "0x") {
+		t.Fatalf("signature = %q, want non-empty 0x-prefixed signature", payload.Order.Signature)
+	}
+	if payload.Order.Salt == "" || payload.Order.Salt == "0" {
+		t.Fatalf("salt = %q, want non-zero", payload.Order.Salt)
+	}
+	if payload.Order.Nonce != "0" {
+		t.Fatalf("nonce = %q, want 0", payload.Order.Nonce)
+	}
+	if payload.Owner != "test-key" {
+		t.Fatalf("owner = %q, want test-key", payload.Owner)
+	}
+}
+
+func TestBuildOrderPayloadRejectsInvalidTokenID(t *testing.T) {
+	t.Parallel()
+
+	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelError}))
+	cfg := config.Config{
+		Wallet: config.WalletConfig{
+			PrivateKey:    "0x1111111111111111111111111111111111111111111111111111111111111111",
+			ChainID:       137,
+			SignatureType: 0,
+		},
+		API: config.APIConfig{CLOBBaseURL: "http://localhost", ApiKey: "k", Secret: "s", Passphrase: "p"},
+	}
+	auth, err := NewAuth(cfg)
+	if err != nil {
+		t.Fatalf("NewAuth: %v", err)
+	}
+	c := NewClient(cfg, auth, logger)
+
+	_, err = c.buildOrderPayload(types.UserOrder{
+		TokenID:   "not-a-number",
+		Price:     0.50,
+		Size:      1,
+		Side:      types.BUY,
+		OrderType: types.OrderTypeGTC,
+		TickSize:  types.Tick001,
+	})
+	if err == nil {
+		t.Fatal("expected error for invalid token ID")
 	}
 }

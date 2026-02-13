@@ -17,10 +17,17 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
+	"math/big"
 	"net/http"
 	"time"
 
+	sdkauth "github.com/GoPolymarket/polymarket-go-sdk/pkg/auth"
+	sdkclob "github.com/GoPolymarket/polymarket-go-sdk/pkg/clob"
+	"github.com/GoPolymarket/polymarket-go-sdk/pkg/clob/clobtypes"
+	sdktypes "github.com/GoPolymarket/polymarket-go-sdk/pkg/types"
+	"github.com/ethereum/go-ethereum/common"
 	"github.com/go-resty/resty/v2"
+	"github.com/shopspring/decimal"
 
 	"polymarket-mm/internal/config"
 	"polymarket-mm/pkg/types"
@@ -29,21 +36,23 @@ import (
 // Client is the Polymarket CLOB REST API client.
 // It wraps a resty HTTP client with rate limiting, retry, and auth.
 type Client struct {
-	http   *resty.Client  // HTTP client with retry + base URL
-	auth   *Auth          // L1/L2 auth provider for request signing
-	rl     *RateLimiter   // per-endpoint-category rate limiting
-	dryRun bool           // when true, mutating methods return fake success without HTTP calls
+	http   *resty.Client // HTTP client with retry + base URL
+	auth   *Auth         // L1/L2 auth provider for request signing
+	rl     *RateLimiter  // per-endpoint-category rate limiting
+	dryRun bool          // when true, mutating methods return fake success without HTTP calls
 	logger *slog.Logger
 }
+
+var zeroAddress = common.HexToAddress("0x0000000000000000000000000000000000000000")
 
 // NewClient creates a REST client with rate limiting and retry.
 func NewClient(cfg config.Config, auth *Auth, logger *slog.Logger) *Client {
 	httpClient := resty.New().
 		SetBaseURL(cfg.API.CLOBBaseURL).
-		SetTimeout(10 * time.Second).
+		SetTimeout(10*time.Second).
 		SetRetryCount(3).
-		SetRetryWaitTime(500 * time.Millisecond).
-		SetRetryMaxWaitTime(5 * time.Second).
+		SetRetryWaitTime(500*time.Millisecond).
+		SetRetryMaxWaitTime(5*time.Second).
 		AddRetryCondition(func(r *resty.Response, err error) bool {
 			if err != nil {
 				return true
@@ -87,30 +96,67 @@ func (c *Client) GetOrderBook(ctx context.Context, tokenID string) (*types.BookR
 // price/size to big.Int maker/taker amounts at the market's tick precision,
 // sets the maker to the funder wallet (proxy), the signer to the EOA,
 // and the taker to the zero address (open order, anyone can fill).
-func (c *Client) buildOrderPayload(order types.UserOrder) types.OrderPayload {
+func (c *Client) buildOrderPayload(order types.UserOrder) (types.OrderPayload, error) {
 	tickSize := order.TickSize
 	if tickSize == "" {
 		tickSize = types.Tick001
 	}
 	makerAmt, takerAmt := PriceToAmounts(order.Price, order.Size, order.Side, tickSize)
 
+	tokenID, ok := new(big.Int).SetString(order.TokenID, 10)
+	if !ok {
+		return types.OrderPayload{}, fmt.Errorf("invalid token id %q: expected base-10 integer string", order.TokenID)
+	}
+
+	expiration := big.NewInt(0)
+	if order.Expiration > 0 {
+		expiration = big.NewInt(order.Expiration)
+	}
+
+	nonce := big.NewInt(0)
+	sigType := int(c.auth.sigType)
+	sdkOrder := &clobtypes.Order{
+		Signer:        c.auth.Address(),
+		Maker:         c.auth.FunderAddress(),
+		Taker:         zeroAddress,
+		TokenID:       sdktypes.U256{Int: tokenID},
+		MakerAmount:   sdktypes.Decimal(decimal.NewFromBigInt(makerAmt, 0)),
+		TakerAmount:   sdktypes.Decimal(decimal.NewFromBigInt(takerAmt, 0)),
+		Expiration:    sdktypes.U256{Int: expiration},
+		Side:          string(order.Side),
+		FeeRateBps:    sdktypes.Decimal(decimal.NewFromInt(int64(order.FeeRateBps))),
+		Nonce:         sdktypes.U256{Int: nonce},
+		SignatureType: &sigType,
+	}
+
+	signedOrder, err := sdkclob.SignOrder(c.auth, &sdkauth.APIKey{
+		Key:        c.auth.creds.ApiKey,
+		Secret:     c.auth.creds.Secret,
+		Passphrase: c.auth.creds.Passphrase,
+	}, sdkOrder)
+	if err != nil {
+		return types.OrderPayload{}, fmt.Errorf("sign order: %w", err)
+	}
+
 	return types.OrderPayload{
 		Order: types.SignedOrder{
-			Maker:         c.auth.FunderAddress().Hex(),
-			Signer:        c.auth.Address().Hex(),
-			Taker:         "0x0000000000000000000000000000000000000000",
+			Salt:          signedOrder.Order.Salt.String(),
+			Maker:         signedOrder.Order.Maker.Hex(),
+			Signer:        signedOrder.Order.Signer.Hex(),
+			Taker:         signedOrder.Order.Taker.Hex(),
 			TokenID:       order.TokenID,
-			MakerAmount:   makerAmt,
-			TakerAmount:   takerAmt,
+			MakerAmount:   signedOrder.Order.MakerAmount.BigInt(),
+			TakerAmount:   signedOrder.Order.TakerAmount.BigInt(),
 			Side:          order.Side,
-			Expiration:    fmt.Sprintf("%d", order.Expiration),
-			Nonce:         "0",
+			Expiration:    signedOrder.Order.Expiration.String(),
+			Nonce:         signedOrder.Order.Nonce.String(),
 			FeeRateBps:    fmt.Sprintf("%d", order.FeeRateBps),
-			SignatureType: c.auth.sigType,
+			SignatureType: types.SignatureType(sigType),
+			Signature:     signedOrder.Signature,
 		},
-		Owner:     c.auth.creds.ApiKey,
+		Owner:     signedOrder.Owner,
 		OrderType: order.OrderType,
-	}
+	}, nil
 }
 
 // PostOrders places up to 15 orders in a batch.
@@ -135,7 +181,11 @@ func (c *Client) PostOrders(ctx context.Context, orders []types.UserOrder, negRi
 
 	payloads := make([]types.OrderPayload, len(orders))
 	for i, order := range orders {
-		payloads[i] = c.buildOrderPayload(order)
+		payload, err := c.buildOrderPayload(order)
+		if err != nil {
+			return nil, fmt.Errorf("build order payload %d: %w", i, err)
+		}
+		payloads[i] = payload
 	}
 
 	body, err := json.Marshal(payloads)
@@ -151,7 +201,7 @@ func (c *Client) PostOrders(ctx context.Context, orders []types.UserOrder, negRi
 	resp, err := c.http.R().
 		SetContext(ctx).
 		SetHeaders(headers).
-		SetBody(payloads).
+		SetBody(json.RawMessage(body)).
 		SetResult(&results).
 		Post("/orders")
 	if err != nil {
@@ -293,6 +343,6 @@ func (c *Client) DeriveAPIKey(ctx context.Context) (*Credentials, error) {
 	}
 
 	c.auth.SetCredentials(result)
-	c.logger.Info("API key derived", "api_key", result.ApiKey)
+	c.logger.Info("API key derived")
 	return &result, nil
 }

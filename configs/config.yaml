@@ -58,3 +58,4 @@ logging:
 dashboard:
   enabled: true
   port: 8080
+  allowed_origins: [] # optional allowlist, e.g. ["http://localhost:8080"]

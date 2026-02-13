@@ -74,10 +74,10 @@ type StrategyConfig struct {
 	StaleBookTimeout time.Duration `mapstructure:"stale_book_timeout"`
 
 	// Phase 1: Toxic flow detection
-	FlowWindow             time.Duration `mapstructure:"flow_window"`
-	FlowToxicityThreshold  float64       `mapstructure:"flow_toxicity_threshold"`
-	FlowCooldownPeriod     time.Duration `mapstructure:"flow_cooldown_period"`
-	FlowMaxSpreadMultiplier float64      `mapstructure:"flow_max_spread_multiplier"`
+	FlowWindow              time.Duration `mapstructure:"flow_window"`
+	FlowToxicityThreshold   float64       `mapstructure:"flow_toxicity_threshold"`
+	FlowCooldownPeriod      time.Duration `mapstructure:"flow_cooldown_period"`
+	FlowMaxSpreadMultiplier float64       `mapstructure:"flow_max_spread_multiplier"`
 }
 
 // RiskConfig sets hard limits that trigger order cancellation (kill switch).
@@ -123,8 +123,9 @@ type LoggingConfig struct {
 
 // DashboardConfig controls the web dashboard server.
 type DashboardConfig struct {
-	Enabled bool `mapstructure:"enabled"`
-	Port    int  `mapstructure:"port"`
+	Enabled        bool     `mapstructure:"enabled"`
+	Port           int      `mapstructure:"port"`
+	AllowedOrigins []string `mapstructure:"allowed_origins"`
 }
 
 // Load reads config from a YAML file with env var overrides.
@@ -172,6 +173,14 @@ func (c *Config) Validate() error {
 	}
 	if c.Wallet.ChainID == 0 {
 		return fmt.Errorf("wallet.chain_id is required (137 for mainnet)")
+	}
+	switch c.Wallet.SignatureType {
+	case 0, 1, 2:
+	default:
+		return fmt.Errorf("wallet.signature_type must be one of: 0 (EOA), 1 (POLY_PROXY), 2 (GNOSIS_SAFE)")
+	}
+	if c.Wallet.SignatureType != 0 && c.Wallet.FunderAddress == "" {
+		return fmt.Errorf("wallet.funder_address is required when wallet.signature_type is 1 or 2")
 	}
 	if c.API.CLOBBaseURL == "" {
 		return fmt.Errorf("api.clob_base_url is required")

@@ -33,7 +33,9 @@ const (
 type SignatureType int
 
 const (
-	SigEOA SignatureType = 0 // externally-owned account (standard wallet)
+	SigEOA        SignatureType = 0 // externally-owned account (standard wallet)
+	SigProxy      SignatureType = 1 // Polymarket proxy / Magic wallet
+	SigGnosisSafe SignatureType = 2 // Gnosis Safe multisig
 )
 
 // TickSize represents the price granularity for a market. Polymarket supports
@@ -89,17 +91,17 @@ func (t TickSize) AmountDecimals() int {
 // layer for quoting. A binary market has exactly two tokens (YES and NO)
 // whose prices always sum to ~$1.
 type MarketInfo struct {
-	ID          string    // Gamma market ID
-	ConditionID string    // CTF condition ID (used for cancels + user WS subscription)
-	Slug        string    // human-readable URL slug
-	Question    string    // the prediction question, e.g. "Will X happen by Y?"
+	ID          string // Gamma market ID
+	ConditionID string // CTF condition ID (used for cancels + user WS subscription)
+	Slug        string // human-readable URL slug
+	Question    string // the prediction question, e.g. "Will X happen by Y?"
 
-	YesTokenID string    // CLOB token ID for the YES outcome
-	NoTokenID  string    // CLOB token ID for the NO outcome
+	YesTokenID string // CLOB token ID for the YES outcome
+	NoTokenID  string // CLOB token ID for the NO outcome
 
-	TickSize     TickSize  // price granularity (determines rounding)
-	MinOrderSize float64   // minimum order size in tokens
-	NegRisk      bool      // true if this is a neg-risk market (affects CTF exchange)
+	TickSize     TickSize // price granularity (determines rounding)
+	MinOrderSize float64  // minimum order size in tokens
+	NegRisk      bool     // true if this is a neg-risk market (affects CTF exchange)
 
 	Active          bool      // market is live
 	Closed          bool      // market has been resolved
@@ -150,12 +152,12 @@ type UserOrder struct {
 // For SELL: maker gives MakerAmount tokens, receives TakerAmount USDC
 type SignedOrder struct {
 	Salt          string        `json:"salt"`
-	Maker         string        `json:"maker"`         // funder/proxy wallet address
-	Signer        string        `json:"signer"`        // EOA that signs the order
-	Taker         string        `json:"taker"`         // zero address = open order
-	TokenID       string        `json:"tokenId"`       // CTF token ID
-	MakerAmount   *big.Int      `json:"makerAmount"`   // what maker gives (scaled to 1e6)
-	TakerAmount   *big.Int      `json:"takerAmount"`   // what maker receives (scaled to 1e6)
+	Maker         string        `json:"maker"`       // funder/proxy wallet address
+	Signer        string        `json:"signer"`      // EOA that signs the order
+	Taker         string        `json:"taker"`       // zero address = open order
+	TokenID       string        `json:"tokenId"`     // CTF token ID
+	MakerAmount   *big.Int      `json:"makerAmount"` // what maker gives (scaled to 1e6)
+	TakerAmount   *big.Int      `json:"takerAmount"` // what maker receives (scaled to 1e6)
 	Side          Side          `json:"side"`
 	Expiration    string        `json:"expiration"`    // unix timestamp as string
 	Nonce         string        `json:"nonce"`         // replay protection
@@ -167,9 +169,9 @@ type SignedOrder struct {
 // OrderPayload is the REST API request body for POST /orders (batch).
 type OrderPayload struct {
 	Order     SignedOrder `json:"order"`
-	Owner     string     `json:"owner"`              // API key of the order owner
-	OrderType OrderType  `json:"orderType"`          // GTC
-	PostOnly  bool       `json:"postOnly,omitempty"` // if true, rejects if it would cross
+	Owner     string      `json:"owner"`              // API key of the order owner
+	OrderType OrderType   `json:"orderType"`          // GTC
+	PostOnly  bool        `json:"postOnly,omitempty"` // if true, rejects if it would cross
 }
 
 // OrderResponse is the REST API response for each order in a batch POST.
@@ -184,12 +186,12 @@ type OrderResponse struct {
 type OpenOrder struct {
 	ID           string `json:"id"`
 	Status       string `json:"status"`        // "live", "matched", etc.
-	Market       string `json:"market"`         // condition ID
-	AssetID      string `json:"asset_id"`       // token ID
-	Side         string `json:"side"`           // "BUY" or "SELL"
-	OriginalSize string `json:"original_size"`  // initial size
-	SizeMatched  string `json:"size_matched"`   // how much has filled
-	Price        string `json:"price"`          // limit price
+	Market       string `json:"market"`        // condition ID
+	AssetID      string `json:"asset_id"`      // token ID
+	Side         string `json:"side"`          // "BUY" or "SELL"
+	OriginalSize string `json:"original_size"` // initial size
+	SizeMatched  string `json:"size_matched"`  // how much has filled
+	Price        string `json:"price"`         // limit price
 }
 
 // CancelResponse is returned by DELETE /orders, /cancel-all, /cancel-market-orders.
@@ -257,11 +259,11 @@ type BookResponse struct {
 type WSBookEvent struct {
 	EventType string       `json:"event_type"` // always "book"
 	AssetID   string       `json:"asset_id"`
-	Market    string       `json:"market"`     // condition ID
+	Market    string       `json:"market"` // condition ID
 	Timestamp string       `json:"timestamp"`
-	Hash      string       `json:"hash"`       // book version hash
-	Buys      []PriceLevel `json:"buys"`       // bid levels
-	Sells     []PriceLevel `json:"sells"`      // ask levels
+	Hash      string       `json:"hash"`  // book version hash
+	Buys      []PriceLevel `json:"buys"`  // bid levels
+	Sells     []PriceLevel `json:"sells"` // ask levels
 }
 
 // WSPriceChange is a single price level update within a price_change event.
@@ -301,16 +303,16 @@ type WSTradeEvent struct {
 // WSOrderEvent is an order lifecycle notification from the user WS channel.
 // Received on order placement, update, or cancellation.
 type WSOrderEvent struct {
-	EventType       string   `json:"event_type"`       // always "order"
-	ID              string   `json:"id"`               // order ID
-	Market          string   `json:"market"`           // condition ID
-	AssetID         string   `json:"asset_id"`         // token ID
-	Side            string   `json:"side"`             // "BUY" or "SELL"
+	EventType       string   `json:"event_type"` // always "order"
+	ID              string   `json:"id"`         // order ID
+	Market          string   `json:"market"`     // condition ID
+	AssetID         string   `json:"asset_id"`   // token ID
+	Side            string   `json:"side"`       // "BUY" or "SELL"
 	Price           string   `json:"price"`
 	OriginalSize    string   `json:"original_size"`
-	SizeMatched     string   `json:"size_matched"`     // cumulative filled
-	Outcome         string   `json:"outcome"`          // "Yes" or "No"
-	Owner           string   `json:"owner"`            // API key
+	SizeMatched     string   `json:"size_matched"` // cumulative filled
+	Outcome         string   `json:"outcome"`      // "Yes" or "No"
+	Owner           string   `json:"owner"`        // API key
 	Timestamp       string   `json:"timestamp"`
 	Type            string   `json:"type"`             // "PLACEMENT", "UPDATE", "CANCELLATION"
 	AssociateTrades []string `json:"associate_trades"` // trade IDs from partial fills
