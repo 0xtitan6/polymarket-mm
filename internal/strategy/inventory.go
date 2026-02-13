@@ -39,14 +39,20 @@ type Inventory struct {
 	yesToken string
 	noToken  string
 	pos      Position
+
+	// Fill history for flow analytics (bounded circular buffer)
+	fillHistory []Fill
+	maxHistory  int
 }
 
 // NewInventory creates inventory tracking for a market.
 func NewInventory(marketID, yesToken, noToken string) *Inventory {
 	return &Inventory{
-		marketID: marketID,
-		yesToken: yesToken,
-		noToken:  noToken,
+		marketID:    marketID,
+		yesToken:    yesToken,
+		noToken:     noToken,
+		fillHistory: make([]Fill, 0, 1000),
+		maxHistory:  1000,
 	}
 }
 
@@ -63,6 +69,12 @@ func (inv *Inventory) OnFill(fill Fill) {
 	}
 
 	inv.pos.LastUpdated = time.Now()
+
+	// Retain fill history for flow analytics (bounded)
+	inv.fillHistory = append(inv.fillHistory, fill)
+	if len(inv.fillHistory) > inv.maxHistory {
+		inv.fillHistory = inv.fillHistory[1:]
+	}
 }
 
 func (inv *Inventory) applyYesFill(fill Fill) {
@@ -153,4 +165,19 @@ func (inv *Inventory) SetPosition(pos Position) {
 	inv.mu.Lock()
 	defer inv.mu.Unlock()
 	inv.pos = pos
+}
+
+// GetRecentFills returns fills that occurred after the given time.
+// Used by FlowTracker and FlowAnalytics for toxicity detection.
+func (inv *Inventory) GetRecentFills(since time.Time) []Fill {
+	inv.mu.RLock()
+	defer inv.mu.RUnlock()
+
+	var recent []Fill
+	for _, fill := range inv.fillHistory {
+		if fill.Timestamp.After(since) {
+			recent = append(recent, fill)
+		}
+	}
+	return recent
 }

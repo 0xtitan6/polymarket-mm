@@ -4,12 +4,26 @@ A Go-based automated market-making bot for Polymarket prediction markets using t
 
 ## Features
 
-- **Avellaneda-Stoikov Strategy**: Dynamic spread pricing based on inventory and risk
+### Core Strategy
+- **Avellaneda-Stoikov Algorithm**: Dynamic spread pricing based on inventory and risk
 - **Real-time Market Data**: WebSocket feeds for orderbook and user events
-- **Risk Management**: Position limits, kill switches, daily loss limits
 - **Market Scanner**: Automatically discovers and monitors active markets
 - **Dashboard**: Web-based monitoring interface on port 8080
 - **Dry Run Mode**: Test strategies without placing real orders
+
+### Advanced Flow Detection (Phase 1) ✅
+- **Toxic Flow Detection**: Identifies adverse selection patterns (e.g., getting picked off by informed traders)
+- **Directional Imbalance Tracking**: Detects when fills are consistently one-sided (100% buys or sells)
+- **Fill Velocity Analysis**: Identifies burst patterns suggesting sweeps or aggressive orders
+- **Adaptive Spread Widening**: Automatically widens spreads 1.0x-3.0x when toxicity detected
+- **Cooldown Protection**: Maintains wider spreads for 2 minutes after toxic flow to avoid repeat attacks
+
+### Risk Management
+- **Position Limits**: Per-market and global exposure caps
+- **Kill Switch**: Auto-cancels all orders on rapid price moves (15% default)
+- **Daily Loss Limit**: Stops trading after hitting daily loss threshold
+- **Cooldown Period**: Enforced pause after kill switch activation
+- **Stale Book Detection**: Cancels quotes if orderbook data becomes stale
 
 ## Architecture
 
@@ -65,6 +79,12 @@ strategy:
   order_size_usd: 1.0     # Quote size per side in USDC
   refresh_interval: 5s    # How often to re-quote
 
+  # Phase 1: Toxic flow detection
+  flow_window: 60s                    # Track fills in last 60 seconds
+  flow_toxicity_threshold: 0.6        # Score > 0.6 triggers spread widening
+  flow_cooldown_period: 120s          # Stay wide for 2 minutes after toxic flow
+  flow_max_spread_multiplier: 3.0     # Max 3x spread widening
+
 risk:
   max_position_per_market: 10.0
   max_global_exposure: 20.0
@@ -103,29 +123,99 @@ Access the web dashboard at `http://localhost:8080` to monitor:
 - Order flow
 - Risk metrics
 
-## Strategy: Avellaneda-Stoikov
+## Strategy: Avellaneda-Stoikov + Flow Detection
 
-The bot uses the Avellaneda-Stoikov market-making algorithm:
+The bot uses the Avellaneda-Stoikov market-making algorithm with advanced flow detection enhancements:
+
+### Base Strategy (Avellaneda-Stoikov)
 
 - **Dynamic Spreads**: Adjusts bid/ask spreads based on inventory risk
 - **Inventory Management**: Skews quotes to mean-revert position to zero
 - **Risk Aversion**: Parameter `gamma` controls how aggressively to reduce inventory
 - **Volatility-Aware**: Uses `sigma` to estimate fair spread based on market volatility
 
-### Key Parameters
-
+**Key Parameters:**
 - `gamma`: Risk aversion (0.05-0.3 typical range)
 - `sigma`: Annualized volatility (0.3-0.8 for prediction markets)
 - `k`: Order arrival intensity
 - `T`: Time horizon in years (~0.00274 = 1 day)
 
+### Phase 1: Toxic Flow Detection ✅ **IMPLEMENTED**
+
+Protects against adverse selection by detecting when informed traders are picking off stale quotes.
+
+**How It Works:**
+1. **Tracks recent fills** in a 60-second rolling window
+2. **Calculates toxicity score**:
+   - **Directional Imbalance** (60% weight): % of fills in dominant direction
+     - 100% same-side fills = 1.0 imbalance (very toxic)
+     - 50/50 split = 0.5 imbalance (balanced)
+   - **Fill Velocity** (40% weight): Fills per minute
+     - >3 fills/min = potential sweep
+   - **Composite Score**: `0.6 × imbalance + 0.4 × velocity`
+3. **Widens spreads** when score > 0.6 (threshold)
+   - Score 0.6 → ~2.0x spread
+   - Score 1.0 → 3.0x spread (max)
+4. **Cooldown period**: Stays wide for 2 minutes after toxicity detected
+
+**Example:**
+```
+Normal: 2% spread (1.0x multiplier)
+Toxic:  6% spread (3.0x multiplier)
+```
+
+**Configuration:**
+```yaml
+strategy:
+  flow_window: 60s                    # Tracking window
+  flow_toxicity_threshold: 0.6        # Trigger threshold
+  flow_cooldown_period: 120s          # Post-toxicity cooldown
+  flow_max_spread_multiplier: 3.0     # Max widening factor
+```
+
+**Metrics Logged:**
+- `toxicity_score`: Composite adverse selection score [0, 1]
+- `directional_imbalance`: % of fills in dominant direction
+- `fill_velocity`: Fills per minute
+- `flow_spread_multiplier`: Current spread multiplier [1.0, 3.0]
+
+**Testing Phase 1:**
+```bash
+# Run unit tests
+GOTOOLCHAIN=auto go test ./internal/strategy/... -v -run TestFlowTracker
+
+# Build and run in dry-run
+go build -o bot cmd/bot/main.go
+./bot  # Monitor logs for toxicity_score metrics
+```
+
+### Future Enhancements (Planned)
+
+**Phase 2: Order Flow Analytics** (Not Yet Implemented)
+- Fill clustering detection (burst patterns)
+- Sweep pattern recognition (large aggressive orders)
+- Orderbook imbalance analysis (bid/ask depth ratio)
+- Asymmetric spread adjustments based on flow pressure
+
+**Phase 3: Resolution Proximity Management** (Not Yet Implemented)
+- Time-to-resolution tracking
+- Progressive risk reduction as markets approach expiry
+- Forced inventory flattening in final hours
+- Emergency stop quoting <30min before resolution
+
 ## Risk Management
 
+### Hard Limits
 - **Position Limits**: Per-market and global exposure caps
-- **Kill Switch**: Auto-cancels all orders on rapid price moves
+- **Kill Switch**: Auto-cancels all orders on rapid price moves (15% default)
 - **Daily Loss Limit**: Stops trading after hitting daily loss threshold
 - **Cooldown Period**: Enforced pause after kill switch activation
 - **Stale Book Detection**: Cancels quotes if orderbook data becomes stale
+
+### Adaptive Protection (Phase 1)
+- **Toxic Flow Detection**: Automatic spread widening when adversely selected
+- **Cooldown Protection**: Maintains wider spreads after toxic periods
+- **Fill Pattern Analysis**: Tracks directional imbalance and velocity
 
 ## Project Structure
 
@@ -151,6 +241,19 @@ The bot uses the Avellaneda-Stoikov market-making algorithm:
 
 ## Development
 
+### Running Tests
+
+```bash
+# All tests
+GOTOOLCHAIN=auto go test ./...
+
+# Strategy tests (includes flow detection)
+GOTOOLCHAIN=auto go test ./internal/strategy/... -v
+
+# Specific feature tests
+GOTOOLCHAIN=auto go test ./internal/strategy/... -v -run TestFlowTracker
+```
+
 ### Testing Credentials
 
 ```bash
@@ -161,6 +264,16 @@ The bot uses the Avellaneda-Stoikov market-making algorithm:
 
 ```bash
 golangci-lint run
+```
+
+### Building
+
+```bash
+# Standard build
+go build -o bot cmd/bot/main.go
+
+# Build with Go 1.24 auto-download
+GOTOOLCHAIN=auto go build -o bot cmd/bot/main.go
 ```
 
 ## Security Notes

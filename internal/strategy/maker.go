@@ -42,6 +42,9 @@ type Maker struct {
 	client     *exchange.Client
 	riskMgr    *risk.Manager
 
+	// Flow detection (Phase 1)
+	flowTracker *FlowTracker
+
 	// Track our outstanding orders
 	activeOrders map[string]types.OpenOrder // orderID -> order
 
@@ -63,12 +66,13 @@ func NewMaker(
 	dashboardEvents chan<- api.DashboardEvent,
 ) *Maker {
 	return &Maker{
-		cfg:             cfg,
-		marketInfo:      info,
-		book:            book,
-		inventory:       inventory,
-		client:          client,
-		riskMgr:         riskMgr,
+		cfg:         cfg,
+		marketInfo:  info,
+		book:        book,
+		inventory:   inventory,
+		client:      client,
+		riskMgr:     riskMgr,
+		flowTracker: NewFlowTracker(cfg.FlowWindow, cfg.FlowToxicityThreshold, cfg.FlowCooldownPeriod, cfg.FlowMaxSpreadMultiplier),
 		activeOrders:    make(map[string]types.OpenOrder),
 		dashboardEvents: dashboardEvents,
 		logger: logger.With(
@@ -208,13 +212,18 @@ func (m *Maker) computeQuotes(mid, remainingBudget float64) (*types.QuotePair, e
 	tickDec := m.marketInfo.TickSize.Decimals()
 	tick := math.Pow(10, -float64(tickDec))
 
+	// Phase 1: Apply flow toxicity adjustment
+	flowMultiplier := m.flowTracker.GetSpreadMultiplier()
+	minSpread *= flowMultiplier
+
 	// Step 1: Reservation price
 	// r = mid - q * gamma * sigma^2 * T
 	reservationPrice := mid - q*gamma*sigma*sigma*T
 
-	// Step 2: Optimal spread
+	// Step 2: Optimal spread (with toxicity adjustment)
 	// delta = gamma * sigma^2 * T + (2/gamma) * ln(1 + gamma/k)
 	optSpread := gamma*sigma*sigma*T + (2.0/gamma)*math.Log(1+gamma/k)
+	optSpread *= flowMultiplier // Widen spread when flow is toxic
 
 	// Step 3: Raw bid/ask
 	bidRaw := reservationPrice - optSpread/2
@@ -285,6 +294,9 @@ func (m *Maker) computeQuotes(mid, remainingBudget float64) (*types.QuotePair, e
 		}
 	}
 
+	// Get toxicity metrics for logging
+	toxicity := m.flowTracker.CalculateToxicity()
+
 	m.logger.Debug("quotes computed",
 		"mid", mid,
 		"q", q,
@@ -294,6 +306,10 @@ func (m *Maker) computeQuotes(mid, remainingBudget float64) (*types.QuotePair, e
 		"bid_size", bidSize,
 		"ask_size", askSize,
 		"spread", askPrice-bidPrice,
+		"toxicity_score", toxicity.ToxicityScore,
+		"directional_imbalance", toxicity.DirectionalImbalance,
+		"fill_velocity", toxicity.FillVelocity,
+		"flow_spread_multiplier", flowMultiplier,
 	)
 
 	return &types.QuotePair{
@@ -409,8 +425,22 @@ func (m *Maker) handleFill(trade types.WSTradeEvent) {
 	}
 
 	m.inventory.OnFill(fill)
+	m.flowTracker.AddFill(fill) // Track for toxicity detection
 
 	pos := m.inventory.Snapshot()
+
+	// Check toxicity after fill
+	toxicity := m.flowTracker.CalculateToxicity()
+	if toxicity.IsAverse {
+		m.logger.Warn("toxic flow detected",
+			"side", trade.Side,
+			"toxicity_score", toxicity.ToxicityScore,
+			"directional_imbalance", toxicity.DirectionalImbalance,
+			"fill_velocity", toxicity.FillVelocity,
+			"fill_count", m.flowTracker.GetFillCount(),
+		)
+	}
+
 	m.logger.Info("fill",
 		"side", trade.Side,
 		"price", price,

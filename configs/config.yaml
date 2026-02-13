@@ -25,6 +25,12 @@ strategy:
   refresh_interval: 5s      # how often to re-quote
   stale_book_timeout: 30s   # cancel quotes if no book update
 
+  # Phase 1: Toxic flow detection
+  flow_window: 60s                    # Track fills in last 60 seconds
+  flow_toxicity_threshold: 0.6        # Score > 0.6 triggers spread widening
+  flow_cooldown_period: 120s          # Stay wide for 2 minutes after toxic flow
+  flow_max_spread_multiplier: 3.0     # Max 3x spread widening
+
 risk:
   max_position_per_market: 10.0
   max_global_exposure: 20.0

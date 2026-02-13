@@ -57,6 +57,12 @@ type APIConfig struct {
 //   - OrderSizeUSD: target notional size per order.
 //   - RefreshInterval: how often to recompute and reconcile quotes.
 //   - StaleBookTimeout: cancel all orders if no book update within this window.
+//
+// Flow Detection (Phase 1):
+//   - FlowWindow: rolling time window for tracking fills (e.g., 60s).
+//   - FlowToxicityThreshold: toxicity score above this triggers spread widening (e.g., 0.6).
+//   - FlowCooldownPeriod: stay wide for this duration after toxicity detected (e.g., 120s).
+//   - FlowMaxSpreadMultiplier: maximum spread widening factor (e.g., 3.0x).
 type StrategyConfig struct {
 	Gamma            float64       `mapstructure:"gamma"`
 	Sigma            float64       `mapstructure:"sigma"`
@@ -66,6 +72,12 @@ type StrategyConfig struct {
 	OrderSizeUSD     float64       `mapstructure:"order_size_usd"`
 	RefreshInterval  time.Duration `mapstructure:"refresh_interval"`
 	StaleBookTimeout time.Duration `mapstructure:"stale_book_timeout"`
+
+	// Phase 1: Toxic flow detection
+	FlowWindow             time.Duration `mapstructure:"flow_window"`
+	FlowToxicityThreshold  float64       `mapstructure:"flow_toxicity_threshold"`
+	FlowCooldownPeriod     time.Duration `mapstructure:"flow_cooldown_period"`
+	FlowMaxSpreadMultiplier float64      `mapstructure:"flow_max_spread_multiplier"`
 }
 
 // RiskConfig sets hard limits that trigger order cancellation (kill switch).
