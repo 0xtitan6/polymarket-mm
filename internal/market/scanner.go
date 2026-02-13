@@ -8,6 +8,7 @@ import (
 	"math"
 	"sort"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/go-resty/resty/v2"
@@ -64,7 +65,7 @@ type Scanner struct {
 	cfg        config.ScannerConfig // filter thresholds + poll interval
 	riskCfg    config.RiskConfig    // MaxMarketsActive, MaxPositionPerMarket
 	logger     *slog.Logger
-	resultCh   chan ScanResult      // engine reads selected markets from here
+	resultCh   chan ScanResult // engine reads selected markets from here
 }
 
 // NewScanner creates a market scanner.
@@ -182,13 +183,51 @@ func (s *Scanner) fetchMarkets(ctx context.Context) ([]GammaMarket, error) {
 }
 
 // filterMarkets applies hard filters to eliminate unsuitable markets:
-// inactive, closed, not accepting orders, no order book, excluded slugs,
-// insufficient liquidity/volume/spread, end date too near or too far, missing token IDs.
+// inactive, closed, not accepting orders, no order book, optional include filters,
+// excluded slugs/keywords, insufficient liquidity/volume/spread, end date too near
+// or too far, missing token IDs.
 func (s *Scanner) filterMarkets(markets []GammaMarket) []GammaMarket {
 	excluded := make(map[string]bool)
 	for _, slug := range s.cfg.ExcludeSlugs {
-		excluded[slug] = true
+		slug = strings.ToLower(strings.TrimSpace(slug))
+		if slug != "" {
+			excluded[slug] = true
+		}
 	}
+
+	includeConditionIDs := make(map[string]bool)
+	for _, conditionID := range s.cfg.IncludeConditionIDs {
+		conditionID = strings.ToLower(strings.TrimSpace(conditionID))
+		if conditionID != "" {
+			includeConditionIDs[conditionID] = true
+		}
+	}
+
+	includeSlugs := make(map[string]bool)
+	for _, slug := range s.cfg.IncludeSlugs {
+		slug = strings.ToLower(strings.TrimSpace(slug))
+		if slug != "" {
+			includeSlugs[slug] = true
+		}
+	}
+
+	includeKeywords := make([]string, 0, len(s.cfg.IncludeKeywords))
+	for _, kw := range s.cfg.IncludeKeywords {
+		kw = strings.ToLower(strings.TrimSpace(kw))
+		if kw != "" {
+			includeKeywords = append(includeKeywords, kw)
+		}
+	}
+
+	excludeKeywords := make([]string, 0, len(s.cfg.ExcludeKeywords))
+	for _, kw := range s.cfg.ExcludeKeywords {
+		kw = strings.ToLower(strings.TrimSpace(kw))
+		if kw != "" {
+			excludeKeywords = append(excludeKeywords, kw)
+		}
+	}
+
+	hasIncludeFilter := len(includeConditionIDs) > 0 || len(includeSlugs) > 0 || len(includeKeywords) > 0
 
 	now := time.Now()
 	maxEnd := now.AddDate(0, 0, s.cfg.MaxEndDateDays)
@@ -198,7 +237,37 @@ func (s *Scanner) filterMarkets(markets []GammaMarket) []GammaMarket {
 		if !m.Active || m.Closed || !m.AcceptingOrders || !m.EnableOrderBook {
 			continue
 		}
-		if excluded[m.Slug] {
+
+		slugLower := strings.ToLower(m.Slug)
+		questionLower := strings.ToLower(m.Question)
+		conditionLower := strings.ToLower(m.ConditionID)
+
+		if hasIncludeFilter {
+			matched := includeConditionIDs[conditionLower] || includeSlugs[slugLower]
+			if !matched {
+				for _, kw := range includeKeywords {
+					if strings.Contains(slugLower, kw) || strings.Contains(questionLower, kw) {
+						matched = true
+						break
+					}
+				}
+			}
+			if !matched {
+				continue
+			}
+		}
+
+		if excluded[slugLower] {
+			continue
+		}
+		excludedByKeyword := false
+		for _, kw := range excludeKeywords {
+			if strings.Contains(slugLower, kw) || strings.Contains(questionLower, kw) {
+				excludedByKeyword = true
+				break
+			}
+		}
+		if excludedByKeyword {
 			continue
 		}
 

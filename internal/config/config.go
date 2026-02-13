@@ -102,13 +102,20 @@ type RiskConfig struct {
 // ScannerConfig controls how the bot discovers and filters tradeable markets.
 // The scanner polls the Gamma API and ranks markets by opportunity score:
 // score = spread * sqrt(volume24h) * min(liquidity/10000, 1).
+// IncludeConditionIDs/IncludeSlugs/IncludeKeywords can constrain discovery to
+// a specific market set (useful for BTC-only strategies). ExcludeKeywords can
+// further remove noisy sub-families (for example 5m/15m contracts).
 type ScannerConfig struct {
-	PollInterval   time.Duration `mapstructure:"poll_interval"`
-	MinLiquidity   float64       `mapstructure:"min_liquidity"`
-	MinVolume24h   float64       `mapstructure:"min_volume_24h"`
-	MinSpread      float64       `mapstructure:"min_spread"`
-	MaxEndDateDays int           `mapstructure:"max_end_date_days"`
-	ExcludeSlugs   []string      `mapstructure:"exclude_slugs"`
+	PollInterval        time.Duration `mapstructure:"poll_interval"`
+	MinLiquidity        float64       `mapstructure:"min_liquidity"`
+	MinVolume24h        float64       `mapstructure:"min_volume_24h"`
+	MinSpread           float64       `mapstructure:"min_spread"`
+	MaxEndDateDays      int           `mapstructure:"max_end_date_days"`
+	IncludeConditionIDs []string      `mapstructure:"include_condition_ids"`
+	IncludeSlugs        []string      `mapstructure:"include_slugs"`
+	IncludeKeywords     []string      `mapstructure:"include_keywords"`
+	ExcludeKeywords     []string      `mapstructure:"exclude_keywords"`
+	ExcludeSlugs        []string      `mapstructure:"exclude_slugs"`
 }
 
 // StoreConfig sets where position data is persisted (JSON files).

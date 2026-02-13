@@ -268,6 +268,20 @@ func (e *Engine) startMarketLocked(alloc types.MarketAllocation) {
 		return
 	}
 
+	// Safety: reconcile startup state by cancelling any pre-existing resting
+	// orders for this market before beginning a new quote lifecycle.
+	reconcileCtx, cancelReconcile := context.WithTimeout(e.ctx, 10*time.Second)
+	_, err := e.client.CancelMarketOrders(reconcileCtx, info.ConditionID)
+	cancelReconcile()
+	if err != nil {
+		e.logger.Error("startup order reconciliation failed, skipping market",
+			"slug", info.Slug,
+			"condition_id", info.ConditionID,
+			"error", err,
+		)
+		return
+	}
+
 	book := market.NewBook(info.ConditionID, info.YesTokenID, info.NoTokenID)
 	inv := strategy.NewInventory(info.ConditionID, info.YesTokenID, info.NoTokenID)
 

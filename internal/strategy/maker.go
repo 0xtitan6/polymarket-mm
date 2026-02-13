@@ -66,13 +66,13 @@ func NewMaker(
 	dashboardEvents chan<- api.DashboardEvent,
 ) *Maker {
 	return &Maker{
-		cfg:         cfg,
-		marketInfo:  info,
-		book:        book,
-		inventory:   inventory,
-		client:      client,
-		riskMgr:     riskMgr,
-		flowTracker: NewFlowTracker(cfg.FlowWindow, cfg.FlowToxicityThreshold, cfg.FlowCooldownPeriod, cfg.FlowMaxSpreadMultiplier),
+		cfg:             cfg,
+		marketInfo:      info,
+		book:            book,
+		inventory:       inventory,
+		client:          client,
+		riskMgr:         riskMgr,
+		flowTracker:     NewFlowTracker(cfg.FlowWindow, cfg.FlowToxicityThreshold, cfg.FlowCooldownPeriod, cfg.FlowMaxSpreadMultiplier),
 		activeOrders:    make(map[string]types.OpenOrder),
 		dashboardEvents: dashboardEvents,
 		logger: logger.With(
@@ -191,17 +191,19 @@ func (m *Maker) quoteUpdate(ctx context.Context) {
 // computeQuotes implements the Avellaneda-Stoikov model for binary markets.
 //
 // Variables:
-//   q     = inventory skew in [-1, 1] from NetDelta()
-//   gamma = risk aversion (higher = tighter spread, less inventory risk)
-//   sigma = estimated volatility
-//   k     = order arrival intensity
-//   T     = time horizon
+//
+//	q     = inventory skew in [-1, 1] from NetDelta()
+//	gamma = risk aversion (higher = tighter spread, less inventory risk)
+//	sigma = estimated volatility
+//	k     = order arrival intensity
+//	T     = time horizon
 //
 // Formulas:
-//   reservation_price = mid - q * gamma * sigma^2 * T
-//   optimal_spread    = gamma * sigma^2 * T + (2/gamma) * ln(1 + gamma/k)
-//   bid = reservation_price - optimal_spread/2
-//   ask = reservation_price + optimal_spread/2
+//
+//	reservation_price = mid - q * gamma * sigma^2 * T
+//	optimal_spread    = gamma * sigma^2 * T + (2/gamma) * ln(1 + gamma/k)
+//	bid = reservation_price - optimal_spread/2
+//	ask = reservation_price + optimal_spread/2
 func (m *Maker) computeQuotes(mid, remainingBudget float64) (*types.QuotePair, error) {
 	q := m.inventory.NetDelta() // [-1, 1]
 	gamma := m.cfg.Gamma
@@ -264,10 +266,17 @@ func (m *Maker) computeQuotes(mid, remainingBudget float64) (*types.QuotePair, e
 	askSize := math.Max(baseSize*sizeFactor, m.marketInfo.MinOrderSize)
 
 	// Limit by remaining risk budget
+	// Keep combined quoted notional (bid + ask) within remaining headroom.
 	maxBidSize := remainingBudget / bidPrice
 	maxAskSize := remainingBudget / askPrice
 	bidSize = math.Min(bidSize, maxBidSize)
 	askSize = math.Min(askSize, maxAskSize)
+	totalNotional := bidSize*bidPrice + askSize*askPrice
+	if totalNotional > remainingBudget && totalNotional > 0 {
+		scale := remainingBudget / totalNotional
+		bidSize *= scale
+		askSize *= scale
+	}
 
 	// Floor to min order size
 	var bid, ask *types.UserOrder

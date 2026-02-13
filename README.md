@@ -8,6 +8,7 @@ A Go-based automated market-making bot for Polymarket prediction markets using t
 - **Avellaneda-Stoikov Algorithm**: Dynamic spread pricing based on inventory and risk
 - **Real-time Market Data**: WebSocket feeds for orderbook and user events
 - **Market Scanner**: Automatically discovers and monitors active markets
+- **Targeted Market Selection**: Optional allowlists by `condition_id`, `slug`, and keyword
 - **Dashboard**: Web-based monitoring interface on port 8080
 - **Dry Run Mode**: Test strategies without placing real orders
 
@@ -89,13 +90,50 @@ risk:
   max_position_per_market: 10.0
   max_global_exposure: 20.0
   kill_switch_drop_pct: 0.15    # 15% price move triggers emergency stop
+
+scanner:
+  # Hard-target exact markets (best for live)
+  include_condition_ids: []
+  include_slugs: []
+
+  # BTC-first market families
+  include_keywords:
+    - "bitcoin-up-or-down-on-"
+    - "bitcoin-up-or-down-"
+    - "bitcoin-above-on-"
+    - "bitcoin-price-on-"
+    - "what-price-will-bitcoin-hit-"
+
+  # Exclude noisy short-horizon contracts
+  exclude_keywords:
+    - "btc-updown-5m"
+    - "btc-updown-15m"
+    - " in 5m"
+    - " in 15m"
 ```
 
-### 3. Test Credentials
+### 3. Define Market Targeting Rules (Recommended)
+
+For live trading, explicitly pin markets instead of scanning everything:
+
+- `scanner.include_condition_ids`: exact condition IDs to allow
+- `scanner.include_slugs`: exact market slugs to allow
+- `scanner.include_keywords`: text match on market `slug`/`question` (case-insensitive)
+- `scanner.exclude_keywords`: text-based denylist (overrides include filters)
+
+Use hard allowlists for production. Keywords are best as a secondary filter.
+
+### 4. Test Credentials
 
 ```bash
 ./scripts/test_credentials.sh
 ```
+
+### 5. Trade Rules
+
+Trading decision rules are documented in:
+
+- `docs/TRADING_RULES.md`
 
 ## Usage
 

@@ -46,6 +46,19 @@ scanner:
   min_volume_24h: 1.0        # $1 minimum volume
   min_spread: 0.001          # 0.1% minimum spread
   max_end_date_days: 1       # Only today's markets
+  include_condition_ids: []  # optional hard allowlist: exact condition IDs to trade
+  include_slugs: []          # optional hard allowlist: exact market slugs to trade
+  include_keywords:          # BTC-only market families (Phase 1)
+    - "bitcoin-up-or-down-on-"
+    - "bitcoin-up-or-down-"
+    - "bitcoin-above-on-"
+    - "bitcoin-price-on-"
+    - "what-price-will-bitcoin-hit-"
+  exclude_keywords:          # avoid thin short-horizon contracts
+    - "btc-updown-5m"
+    - "btc-updown-15m"
+    - " in 5m"
+    - " in 15m"
   exclude_slugs: []
 
 store:

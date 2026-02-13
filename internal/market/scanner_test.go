@@ -10,11 +10,15 @@ import (
 
 func testScannerConfig() config.ScannerConfig {
 	return config.ScannerConfig{
-		MinLiquidity:   1000,
-		MinVolume24h:   500,
-		MinSpread:      0.01,
-		MaxEndDateDays: 90,
-		ExcludeSlugs:   []string{"excluded-slug"},
+		MinLiquidity:        1000,
+		MinVolume24h:        500,
+		MinSpread:           0.01,
+		MaxEndDateDays:      90,
+		IncludeConditionIDs: nil,
+		IncludeSlugs:        nil,
+		IncludeKeywords:     nil,
+		ExcludeKeywords:     nil,
+		ExcludeSlugs:        []string{"excluded-slug"},
 	}
 }
 
@@ -153,6 +157,21 @@ func TestFilterMarketsRejectsExcludedSlug(t *testing.T) {
 	}
 }
 
+func TestFilterMarketsRejectsExcludedKeyword(t *testing.T) {
+	t.Parallel()
+	s := newTestScanner()
+	s.cfg.ExcludeKeywords = []string{"5m"}
+
+	m := baseMarket()
+	m.Slug = "btc-updown-5m-12345"
+	m.Question = "BTC up or down in 5m?"
+	result := s.filterMarkets([]GammaMarket{m})
+
+	if len(result) != 0 {
+		t.Errorf("expected 0 markets for excluded keyword, got %d", len(result))
+	}
+}
+
 func TestFilterMarketsRejectsExpiredEndDate(t *testing.T) {
 	t.Parallel()
 	s := newTestScanner()
@@ -189,6 +208,100 @@ func TestFilterMarketsRejectsNoTokenIDs(t *testing.T) {
 
 	if len(result) != 0 {
 		t.Errorf("expected 0 markets for missing token IDs, got %d", len(result))
+	}
+}
+
+func TestFilterMarketsIncludesConditionID(t *testing.T) {
+	t.Parallel()
+	s := newTestScanner()
+	s.cfg.IncludeConditionIDs = []string{"cond1"}
+
+	m := baseMarket()
+	m.ConditionID = "cond1"
+	other := baseMarket()
+	other.ConditionID = "other-cond"
+	other.Slug = "other-market"
+
+	result := s.filterMarkets([]GammaMarket{m, other})
+	if len(result) != 1 {
+		t.Fatalf("expected 1 market, got %d", len(result))
+	}
+	if result[0].ConditionID != "cond1" {
+		t.Fatalf("expected cond1, got %s", result[0].ConditionID)
+	}
+}
+
+func TestFilterMarketsIncludesSlug(t *testing.T) {
+	t.Parallel()
+	s := newTestScanner()
+	s.cfg.IncludeSlugs = []string{"btc-up-down-15m"}
+
+	m := baseMarket()
+	m.Slug = "btc-up-down-15m"
+	other := baseMarket()
+	other.Slug = "eth-up-down-15m"
+	other.ConditionID = "cond2"
+
+	result := s.filterMarkets([]GammaMarket{m, other})
+	if len(result) != 1 {
+		t.Fatalf("expected 1 market, got %d", len(result))
+	}
+	if result[0].Slug != "btc-up-down-15m" {
+		t.Fatalf("expected slug btc-up-down-15m, got %s", result[0].Slug)
+	}
+}
+
+func TestFilterMarketsIncludesKeywordCaseInsensitive(t *testing.T) {
+	t.Parallel()
+	s := newTestScanner()
+	s.cfg.IncludeKeywords = []string{"BitCoin"}
+
+	m := baseMarket()
+	m.Question = "Will Bitcoin close above $110k today?"
+	m.Slug = "will-btc-close-above-110k"
+
+	other := baseMarket()
+	other.Question = "Will ETH close above $5k today?"
+	other.Slug = "will-eth-close-above-5k"
+	other.ConditionID = "cond2"
+
+	result := s.filterMarkets([]GammaMarket{m, other})
+	if len(result) != 1 {
+		t.Fatalf("expected 1 market, got %d", len(result))
+	}
+	if result[0].ConditionID != m.ConditionID {
+		t.Fatalf("expected condition %s, got %s", m.ConditionID, result[0].ConditionID)
+	}
+}
+
+func TestFilterMarketsIncludeThenExclude(t *testing.T) {
+	t.Parallel()
+	s := newTestScanner()
+	s.cfg.IncludeSlugs = []string{"btc-up-down-15m"}
+	s.cfg.ExcludeSlugs = []string{"btc-up-down-15m"}
+
+	m := baseMarket()
+	m.Slug = "btc-up-down-15m"
+
+	result := s.filterMarkets([]GammaMarket{m})
+	if len(result) != 0 {
+		t.Fatalf("expected 0 markets because exclude should win, got %d", len(result))
+	}
+}
+
+func TestFilterMarketsIncludeThenExcludeKeyword(t *testing.T) {
+	t.Parallel()
+	s := newTestScanner()
+	s.cfg.IncludeKeywords = []string{"bitcoin"}
+	s.cfg.ExcludeKeywords = []string{"5m"}
+
+	m := baseMarket()
+	m.Slug = "bitcoin-up-or-down-5m"
+	m.Question = "Bitcoin up or down in 5m?"
+
+	result := s.filterMarkets([]GammaMarket{m})
+	if len(result) != 0 {
+		t.Fatalf("expected 0 markets because exclude keyword should win, got %d", len(result))
 	}
 }
 

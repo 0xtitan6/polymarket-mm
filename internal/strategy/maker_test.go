@@ -23,9 +23,9 @@ func testStrategyConfig() config.StrategyConfig {
 		RefreshInterval:  5 * time.Second,
 		StaleBookTimeout: 30 * time.Second,
 		// Phase 1: Flow detection defaults
-		FlowWindow:             60 * time.Second,
-		FlowToxicityThreshold:  0.6,
-		FlowCooldownPeriod:     120 * time.Second,
+		FlowWindow:              60 * time.Second,
+		FlowToxicityThreshold:   0.6,
+		FlowCooldownPeriod:      120 * time.Second,
 		FlowMaxSpreadMultiplier: 3.0,
 	}
 }
@@ -46,11 +46,11 @@ func setupMaker(cfg config.StrategyConfig, info types.MarketInfo) *Maker {
 	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelError}))
 
 	return &Maker{
-		cfg:         cfg,
-		marketInfo:  info,
-		book:        b,
-		inventory:   inv,
-		flowTracker: NewFlowTracker(cfg.FlowWindow, cfg.FlowToxicityThreshold, cfg.FlowCooldownPeriod, cfg.FlowMaxSpreadMultiplier),
+		cfg:          cfg,
+		marketInfo:   info,
+		book:         b,
+		inventory:    inv,
+		flowTracker:  NewFlowTracker(cfg.FlowWindow, cfg.FlowToxicityThreshold, cfg.FlowCooldownPeriod, cfg.FlowMaxSpreadMultiplier),
 		activeOrders: make(map[string]types.OpenOrder),
 		logger:       logger,
 	}
@@ -175,6 +175,28 @@ func TestComputeQuotesBudgetExhausted(t *testing.T) {
 	}
 	if quotes.Ask != nil {
 		t.Errorf("expected nil ask with exhausted budget, got price=%v", quotes.Ask.Price)
+	}
+}
+
+func TestComputeQuotesCombinedNotionalWithinBudget(t *testing.T) {
+	t.Parallel()
+	cfg := testStrategyConfig()
+	info := testMarketInfo()
+	m := setupMaker(cfg, info)
+
+	mid := 0.50
+	budget := 25.0
+	quotes, err := m.computeQuotes(mid, budget)
+	if err != nil {
+		t.Fatalf("computeQuotes: %v", err)
+	}
+	if quotes.Bid == nil || quotes.Ask == nil {
+		t.Fatalf("expected both bid and ask for budget check")
+	}
+
+	totalNotional := quotes.Bid.Price*quotes.Bid.Size + quotes.Ask.Price*quotes.Ask.Size
+	if totalNotional > budget+1e-9 {
+		t.Fatalf("combined quoted notional exceeds budget: got %.6f > %.6f", totalNotional, budget)
 	}
 }
 
