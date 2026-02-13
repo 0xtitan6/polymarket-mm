@@ -22,6 +22,11 @@ func testStrategyConfig() config.StrategyConfig {
 		OrderSizeUSD:     50,
 		RefreshInterval:  5 * time.Second,
 		StaleBookTimeout: 30 * time.Second,
+		// Phase 1: Flow detection defaults
+		FlowWindow:             60 * time.Second,
+		FlowToxicityThreshold:  0.6,
+		FlowCooldownPeriod:     120 * time.Second,
+		FlowMaxSpreadMultiplier: 3.0,
 	}
 }
 
@@ -41,10 +46,11 @@ func setupMaker(cfg config.StrategyConfig, info types.MarketInfo) *Maker {
 	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelError}))
 
 	return &Maker{
-		cfg:          cfg,
-		marketInfo:   info,
-		book:         b,
-		inventory:    inv,
+		cfg:         cfg,
+		marketInfo:  info,
+		book:        b,
+		inventory:   inv,
+		flowTracker: NewFlowTracker(cfg.FlowWindow, cfg.FlowToxicityThreshold, cfg.FlowCooldownPeriod, cfg.FlowMaxSpreadMultiplier),
 		activeOrders: make(map[string]types.OpenOrder),
 		logger:       logger,
 	}
