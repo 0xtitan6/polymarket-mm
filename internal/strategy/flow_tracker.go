@@ -114,12 +114,14 @@ func (ft *FlowTracker) CalculateToxicity() ToxicityMetrics {
 	directionalImbalance := dominant / float64(totalFills)
 
 	// Fill velocity: fills per minute
-	if len(ft.fills) < 2 {
+	// Require at least 3 fills before making toxicity judgments.
+	// 1-2 fills have 100% directional imbalance by definition — that's noise, not signal.
+	if len(ft.fills) < 3 {
 		return ToxicityMetrics{
 			DirectionalImbalance: directionalImbalance,
 			FillVelocity:         0,
-			ToxicityScore:        directionalImbalance * 0.6, // Only directional component
-			IsAverse:             directionalImbalance > ft.toxicityThreshold,
+			ToxicityScore:        0,
+			IsAverse:             false,
 		}
 	}
 
