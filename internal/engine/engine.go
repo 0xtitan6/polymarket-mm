@@ -2,12 +2,16 @@
 //
 // It wires together all subsystems:
 //
-//  1. Scanner discovers wide-spread markets on Polymarket.
+//  1. Scanner discovers wide-spread markets on Polymarket US.
 //  2. Engine starts/stops a strategy goroutine per market (reconcileMarkets).
 //  3. Each market gets: a Book (order book mirror), an Inventory (position tracker),
 //     and a Maker (the Avellaneda-Stoikov strategy that quotes bid/ask).
-//  4. Two WebSocket feeds (market data + user fills) dispatch events to the correct market slot.
+//  4. Two WebSocket feeds (market data + private fills) dispatch events to the correct market slot.
 //  5. Risk manager monitors all markets and can trigger a kill switch.
+//
+// Key difference from the old Polygon-based engine: markets are identified by
+// slug (not conditionID/tokenID). The slug is used everywhere — WS subscriptions,
+// slot map keys, order placement, and persistence.
 //
 // Lifecycle: New() → Start() → [runs until SIGINT] → Stop()
 package engine
@@ -53,14 +57,17 @@ type Engine struct {
 	store   *store.Store
 	logger  *slog.Logger
 
-	// slots maps conditionID → running market. Protected by slotsMu.
+	// slots maps slug → running market. Protected by slotsMu.
+	// In the US API, the market slug is the universal identifier (replaces conditionID).
 	slots   map[string]*marketSlot
 	slotsMu sync.RWMutex
 
-	// tokenMap maps tokenID → conditionID so WS market events (keyed by token)
-	// can be routed to the correct market slot (keyed by condition).
-	tokenMap   map[string]string
-	tokenMapMu sync.RWMutex
+	// slugMap maps slug → slug (identity) for WS event routing.
+	// In the US API, WS events are keyed by market_slug, which is also
+	// the slot key. This map is kept for structural parity with the old
+	// token→condition routing, but is effectively an identity mapping.
+	slugMap   map[string]string
+	slugMapMu sync.RWMutex
 
 	// dashboardEvents is an optional channel for sending events to the dashboard.
 	// Nil if dashboard is disabled.
@@ -72,7 +79,7 @@ type Engine struct {
 }
 
 // New creates and wires all engine components.
-// If L2 API credentials aren't configured, it derives them via L1 (EIP-712) auth.
+// Ed25519 credentials must be configured (no key derivation step on the US API).
 func New(cfg config.Config, logger *slog.Logger) (*Engine, error) {
 	auth, err := exchange.NewAuth(cfg)
 	if err != nil {
@@ -81,19 +88,22 @@ func New(cfg config.Config, logger *slog.Logger) (*Engine, error) {
 
 	client := exchange.NewClient(cfg, auth, logger)
 
-	// Derive API key if not provided
+	// The US API uses static Ed25519 keys — no derivation needed.
+	// HasL2Credentials always returns true, but handle gracefully just in case.
 	if !auth.HasL2Credentials() {
-		logger.Info("no L2 credentials, deriving API key via L1...")
-		creds, err := client.DeriveAPIKey(context.Background())
-		if err != nil {
-			return nil, err
-		}
-		auth.SetCredentials(*creds)
+		logger.Warn("Ed25519 credentials not configured — bot will not be able to place orders")
 	}
 
-	mktFeed := exchange.NewMarketFeed(cfg.API.WSMarketURL, logger)
-	usrFeed := exchange.NewUserFeed(cfg.API.WSUserURL, auth, logger)
-	scanner := market.NewScanner(cfg, logger)
+	// Market feed: authenticated via upgrade handshake headers
+	mktFeed := exchange.NewMarketFeed(cfg.API.WSMarketURL, auth, logger)
+	// Private feed: authenticated via upgrade handshake headers
+	usrFeed := exchange.NewUserFeed(cfg.API.WSPrivateURL, auth, logger)
+	// If WSPrivateURL is empty, fall back to WSUserURL (compatibility alias)
+	if cfg.API.WSPrivateURL == "" && cfg.API.WSUserURL != "" {
+		usrFeed = exchange.NewUserFeed(cfg.API.WSUserURL, auth, logger)
+	}
+
+	scanner := market.NewScanner(client, cfg, logger)
 	riskMgr := risk.NewManager(cfg.Risk, logger)
 
 	st, err := store.Open(cfg.Store.DataDir)
@@ -119,7 +129,7 @@ func New(cfg config.Config, logger *slog.Logger) (*Engine, error) {
 		store:           st,
 		logger:          logger.With("component", "engine"),
 		slots:           make(map[string]*marketSlot),
-		tokenMap:        make(map[string]string),
+		slugMap:         make(map[string]string),
 		dashboardEvents: dashEvents,
 		ctx:             ctx,
 		cancel:          cancel,
@@ -142,7 +152,7 @@ func (e *Engine) Start() error {
 	go func() {
 		defer e.wg.Done()
 		if err := e.usrFeed.Run(e.ctx); err != nil && e.ctx.Err() == nil {
-			e.logger.Error("user feed error", "error", err)
+			e.logger.Error("private feed error", "error", err)
 		}
 	}()
 
@@ -237,10 +247,11 @@ func (e *Engine) manageMarkets() {
 
 // reconcileMarkets diffs the desired market set (from scanner) against currently
 // running markets. Stops markets no longer desired, starts newly discovered ones.
+// Markets are keyed by slug (which equals ConditionID in the US API architecture).
 func (e *Engine) reconcileMarkets(result market.ScanResult) {
 	desired := make(map[string]types.MarketAllocation)
 	for _, alloc := range result.Markets {
-		desired[alloc.Market.ConditionID] = alloc
+		desired[alloc.Market.Slug] = alloc
 	}
 
 	e.slotsMu.Lock()
@@ -263,30 +274,31 @@ func (e *Engine) reconcileMarkets(result market.ScanResult) {
 
 func (e *Engine) startMarketLocked(alloc types.MarketAllocation) {
 	info := alloc.Market
-	if info.YesTokenID == "" || info.NoTokenID == "" {
-		e.logger.Warn("skipping market with missing token IDs", "slug", info.Slug)
+	slug := info.Slug
+	if slug == "" {
+		e.logger.Warn("skipping market with missing slug")
 		return
 	}
 
-	// Safety: reconcile startup state by cancelling any pre-existing resting
-	// orders for this market before beginning a new quote lifecycle.
+	// Safety: cancel any pre-existing resting orders for this market.
 	reconcileCtx, cancelReconcile := context.WithTimeout(e.ctx, 10*time.Second)
-	_, err := e.client.CancelMarketOrders(reconcileCtx, info.ConditionID)
+	_, err := e.client.CancelMarketOrders(reconcileCtx, slug)
 	cancelReconcile()
 	if err != nil {
 		e.logger.Error("startup order reconciliation failed, skipping market",
-			"slug", info.Slug,
-			"condition_id", info.ConditionID,
+			"slug", slug,
 			"error", err,
 		)
 		return
 	}
 
-	book := market.NewBook(info.ConditionID, info.YesTokenID, info.NoTokenID)
-	inv := strategy.NewInventory(info.ConditionID, info.YesTokenID, info.NoTokenID)
+	// In the US API, the slug serves as the book identifier (replacing token IDs).
+	// Both YES and NO are represented by the same single-instrument slug.
+	book := market.NewBook(slug, slug, slug)
+	inv := strategy.NewInventory(slug, slug, slug)
 
 	// Restore position from persistence
-	if pos, err := e.store.LoadPosition(info.ConditionID); err == nil && pos != nil {
+	if pos, err := e.store.LoadPosition(slug); err == nil && pos != nil {
 		inv.SetPosition(*pos)
 	}
 
@@ -302,6 +314,7 @@ func (e *Engine) startMarketLocked(alloc types.MarketAllocation) {
 		e.riskMgr,
 		e.logger,
 		e.dashboardEvents,
+		e.store.SavePosition,
 	)
 
 	ctx, cancel := context.WithCancel(e.ctx)
@@ -316,25 +329,23 @@ func (e *Engine) startMarketLocked(alloc types.MarketAllocation) {
 		orderCh:   orderCh,
 	}
 
-	e.slots[info.ConditionID] = slot
+	e.slots[slug] = slot
 
-	// Register token -> conditionID mapping
-	e.tokenMapMu.Lock()
-	e.tokenMap[info.YesTokenID] = info.ConditionID
-	e.tokenMap[info.NoTokenID] = info.ConditionID
-	e.tokenMapMu.Unlock()
+	// Register slug in the routing map (identity mapping for US API)
+	e.slugMapMu.Lock()
+	e.slugMap[slug] = slug
+	e.slugMapMu.Unlock()
 
-	// Subscribe WebSocket feeds
-	e.mktFeed.Subscribe(ctx, []string{info.YesTokenID, info.NoTokenID})
-	e.usrFeed.Subscribe(ctx, []string{info.ConditionID})
+	// Subscribe to market data WS for this slug
+	e.mktFeed.Subscribe(ctx, []string{slug})
+	// Private feed subscribes globally (no per-market subscription needed)
+	e.usrFeed.Subscribe(ctx, []string{slug})
 
-	// Fetch initial book snapshots synchronously before starting strategy
-	for _, tokenID := range []string{info.YesTokenID, info.NoTokenID} {
-		resp, err := e.client.GetOrderBook(ctx, tokenID)
-		if err != nil {
-			e.logger.Error("failed to get initial book", "token", tokenID, "error", err)
-			continue
-		}
+	// Fetch initial order book snapshot
+	resp, err := e.client.GetOrderBook(ctx, slug)
+	if err != nil {
+		e.logger.Error("failed to get initial book", "slug", slug, "error", err)
+	} else {
 		book.ApplyBookResponse(resp)
 	}
 
@@ -346,15 +357,14 @@ func (e *Engine) startMarketLocked(alloc types.MarketAllocation) {
 	}()
 
 	e.logger.Info("market started",
-		"slug", info.Slug,
-		"condition_id", info.ConditionID,
+		"slug", slug,
 		"spread", info.Spread,
 		"score", alloc.Score,
 	)
 }
 
-func (e *Engine) stopMarketLocked(conditionID string) {
-	slot, ok := e.slots[conditionID]
+func (e *Engine) stopMarketLocked(slug string) {
+	slot, ok := e.slots[slug]
 	if !ok {
 		return
 	}
@@ -364,24 +374,23 @@ func (e *Engine) stopMarketLocked(conditionID string) {
 
 	// Save position
 	pos := slot.inventory.Snapshot()
-	if err := e.store.SavePosition(conditionID, pos); err != nil {
-		e.logger.Error("failed to save position on stop", "market", conditionID, "error", err)
+	if err := e.store.SavePosition(slug, pos); err != nil {
+		e.logger.Error("failed to save position on stop", "market", slug, "error", err)
 	}
 
 	// Unsubscribe WS
-	e.mktFeed.Unsubscribe(e.ctx, []string{slot.info.YesTokenID, slot.info.NoTokenID})
-	e.usrFeed.Unsubscribe(e.ctx, []string{conditionID})
+	e.mktFeed.Unsubscribe(e.ctx, []string{slug})
+	e.usrFeed.Unsubscribe(e.ctx, []string{slug})
 
 	// Clean up risk state
-	e.riskMgr.RemoveMarket(conditionID)
+	e.riskMgr.RemoveMarket(slug)
 
-	// Clean up token map
-	e.tokenMapMu.Lock()
-	delete(e.tokenMap, slot.info.YesTokenID)
-	delete(e.tokenMap, slot.info.NoTokenID)
-	e.tokenMapMu.Unlock()
+	// Clean up slug map
+	e.slugMapMu.Lock()
+	delete(e.slugMap, slug)
+	e.slugMapMu.Unlock()
 
-	delete(e.slots, conditionID)
+	delete(e.slots, slug)
 
 	e.logger.Info("market stopped", "slug", slot.info.Slug)
 }
@@ -425,6 +434,9 @@ func (e *Engine) handleKillSignal(kill risk.KillSignal) {
 }
 
 // dispatchMarketEvents routes WS market events to the correct slot's Book.
+// In the US API, book events are keyed by market_slug (which is our slot key).
+// PriceChangeEvents returns a nil channel (US API sends full snapshots),
+// so that select branch never fires.
 func (e *Engine) dispatchMarketEvents() {
 	for {
 		select {
@@ -432,22 +444,16 @@ func (e *Engine) dispatchMarketEvents() {
 			return
 		case evt := <-e.mktFeed.BookEvents():
 			e.routeBookEvent(evt)
-		case evt := <-e.mktFeed.PriceChangeEvents():
-			e.routePriceChange(evt)
 		}
 	}
 }
 
 func (e *Engine) routeBookEvent(evt types.WSBookEvent) {
-	e.tokenMapMu.RLock()
-	conditionID, ok := e.tokenMap[evt.AssetID]
-	e.tokenMapMu.RUnlock()
-	if !ok {
-		return
-	}
+	// In the US API, AssetID is the market slug (set by legacy translation).
+	slug := evt.AssetID
 
 	e.slotsMu.RLock()
-	slot, ok := e.slots[conditionID]
+	slot, ok := e.slots[slug]
 	e.slotsMu.RUnlock()
 	if !ok {
 		return
@@ -456,58 +462,23 @@ func (e *Engine) routeBookEvent(evt types.WSBookEvent) {
 	slot.book.ApplyBookEvent(evt)
 }
 
-func (e *Engine) routePriceChange(evt types.WSPriceChangeEvent) {
-	if len(evt.PriceChanges) == 0 {
-		return
-	}
-
-	e.tokenMapMu.RLock()
-	conditionID, ok := e.tokenMap[evt.PriceChanges[0].AssetID]
-	e.tokenMapMu.RUnlock()
-	if !ok {
-		return
-	}
-
-	e.slotsMu.RLock()
-	slot, ok := e.slots[conditionID]
-	e.slotsMu.RUnlock()
-	if !ok {
-		return
-	}
-
-	slot.book.ApplyPriceChange(evt)
-}
-
-// dispatchUserEvents routes WS user events to the correct slot's channels.
+// dispatchUserEvents routes WS private events to the correct slot's channels.
+// In the US API, order/fill events arrive on OrderEvents() keyed by market_slug.
+// TradeEvents() returns a nil channel (fills come as EXECUTION_TYPE_FILL on the
+// order channel), so that branch never fires.
 func (e *Engine) dispatchUserEvents() {
 	for {
 		select {
 		case <-e.ctx.Done():
 			return
-		case trade := <-e.usrFeed.TradeEvents():
-			e.routeTrade(trade)
 		case order := <-e.usrFeed.OrderEvents():
 			e.routeOrder(order)
 		}
 	}
 }
 
-func (e *Engine) routeTrade(trade types.WSTradeEvent) {
-	e.slotsMu.RLock()
-	slot, ok := e.slots[trade.Market]
-	e.slotsMu.RUnlock()
-	if !ok {
-		return
-	}
-
-	select {
-	case slot.tradeCh <- trade:
-	default:
-		e.logger.Warn("trade channel full", "market", trade.Market)
-	}
-}
-
 func (e *Engine) routeOrder(order types.WSOrderEvent) {
+	// In the US API, Market is the market_slug.
 	e.slotsMu.RLock()
 	slot, ok := e.slots[order.Market]
 	e.slotsMu.RUnlock()
@@ -568,7 +539,7 @@ func (e *Engine) GetMarketsSnapshot() []api.MarketStatus {
 		}
 
 		status := api.MarketStatus{
-			ConditionID:      slot.info.ConditionID,
+			ConditionID:      slot.info.Slug, // slug is the primary ID on US API
 			Slug:             slot.info.Slug,
 			Question:         slot.info.Question,
 			MidPrice:         mid,
