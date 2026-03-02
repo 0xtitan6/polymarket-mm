@@ -2,56 +2,25 @@ package market
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"log/slog"
-	"math"
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
-	"github.com/go-resty/resty/v2"
-
 	"polymarket-mm/internal/config"
+	"polymarket-mm/internal/exchange"
 	"polymarket-mm/pkg/types"
 )
 
-// Scanner periodically polls the Gamma API to discover the best market-making
-// opportunities. It ranks markets by a composite score:
+// Scanner periodically polls the Polymarket US API to discover the best
+// market-making opportunities. It fetches active markets, applies keyword/slug
+// filters, fetches BBO for each candidate, and ranks by spread.
 //
-//   score = spread × √(volume24h) × min(liquidity/10000, 1)
-//
-// High-spread, high-volume, reasonably liquid markets score highest. The engine
-// reads ScanResults from the Results() channel and starts/stops market goroutines
-// to match the selected markets.
-
-// GammaMarket is the JSON shape returned by the Gamma API.
-type GammaMarket struct {
-	ID                    string  `json:"id"`
-	Question              string  `json:"question"`
-	ConditionID           string  `json:"conditionId"`
-	Slug                  string  `json:"slug"`
-	Active                bool    `json:"active"`
-	Closed                bool    `json:"closed"`
-	AcceptingOrders       bool    `json:"acceptingOrders"`
-	EnableOrderBook       bool    `json:"enableOrderBook"`
-	EndDate               string  `json:"endDate"`
-	Liquidity             string  `json:"liquidity"`
-	Volume24hr            float64 `json:"volume24hr"`
-	Outcomes              string  `json:"outcomes"`
-	OutcomePrices         string  `json:"outcomePrices"`
-	ClobTokenIds          string  `json:"clobTokenIds"`
-	NegRisk               bool    `json:"negRisk"`
-	Spread                float64 `json:"spread"`
-	BestBid               float64 `json:"bestBid"`
-	BestAsk               float64 `json:"bestAsk"`
-	LastTradePrice        float64 `json:"lastTradePrice"`
-	OrderPriceMinTickSize float64 `json:"orderPriceMinTickSize"`
-	OrderMinSize          float64 `json:"orderMinSize"`
-	RewardsMinSize        float64 `json:"rewardsMinSize"`
-	RewardsMaxSpread      float64 `json:"rewardsMaxSpread"`
-}
+// Since the US market list endpoint does not include inline BBO or volume data,
+// the scanner fetches BBO for each filtered market to compute spreads.
 
 // ScanResult contains markets ranked by opportunity quality.
 type ScanResult struct {
@@ -59,29 +28,23 @@ type ScanResult struct {
 	ScannedAt time.Time
 }
 
-// Scanner periodically polls the Gamma API for wide-spread markets.
+// Scanner periodically polls the US API for wide-spread markets.
 type Scanner struct {
-	httpClient *resty.Client        // HTTP client pointed at Gamma API
-	cfg        config.ScannerConfig // filter thresholds + poll interval
-	riskCfg    config.RiskConfig    // MaxMarketsActive, MaxPositionPerMarket
-	logger     *slog.Logger
-	resultCh   chan ScanResult // engine reads selected markets from here
+	client  *exchange.Client    // US API client
+	cfg     config.ScannerConfig // filter thresholds + poll interval
+	riskCfg config.RiskConfig   // MaxMarketsActive, MaxPositionPerMarket
+	logger  *slog.Logger
+	resultCh chan ScanResult // engine reads selected markets from here
 }
 
-// NewScanner creates a market scanner.
-func NewScanner(cfg config.Config, logger *slog.Logger) *Scanner {
-	client := resty.New().
-		SetBaseURL(cfg.API.GammaBaseURL).
-		SetTimeout(15 * time.Second).
-		SetRetryCount(2).
-		SetRetryWaitTime(time.Second)
-
+// NewScanner creates a market scanner backed by the given exchange client.
+func NewScanner(client *exchange.Client, cfg config.Config, logger *slog.Logger) *Scanner {
 	return &Scanner{
-		httpClient: client,
-		cfg:        cfg.Scanner,
-		riskCfg:    cfg.Risk,
-		logger:     logger.With("component", "scanner"),
-		resultCh:   make(chan ScanResult, 1),
+		client:   client,
+		cfg:      cfg.Scanner,
+		riskCfg:  cfg.Risk,
+		logger:   logger.With("component", "scanner"),
+		resultCh: make(chan ScanResult, 1),
 	}
 }
 
@@ -116,7 +79,9 @@ func (s *Scanner) scan(ctx context.Context) {
 	}
 
 	filtered := s.filterMarkets(markets)
-	ranked := s.rankMarkets(filtered)
+
+	// Fetch BBO for each filtered market to get spread/pricing data
+	ranked := s.rankWithBBO(ctx, filtered)
 
 	// Cap to max active markets
 	if len(ranked) > s.riskCfg.MaxMarketsActive {
@@ -147,28 +112,23 @@ func (s *Scanner) scan(ctx context.Context) {
 	}
 }
 
-func (s *Scanner) fetchMarkets(ctx context.Context) ([]GammaMarket, error) {
-	var allMarkets []GammaMarket
+func (s *Scanner) fetchMarkets(ctx context.Context) ([]types.USMarket, error) {
+	var allMarkets []types.USMarket
 	offset := 0
 	limit := 100
 
+	active := true
+	closed := false
+
 	for {
-		var page []GammaMarket
-		resp, err := s.httpClient.R().
-			SetContext(ctx).
-			SetQueryParams(map[string]string{
-				"limit":  strconv.Itoa(limit),
-				"offset": strconv.Itoa(offset),
-				"active": "true",
-				"closed": "false",
-			}).
-			SetResult(&page).
-			Get("/markets")
+		page, err := s.client.GetMarkets(ctx, types.MarketQueryParams{
+			Active: &active,
+			Closed: &closed,
+			Limit:  limit,
+			Offset: offset,
+		})
 		if err != nil {
-			return nil, fmt.Errorf("fetch markets page %d: %w", offset, err)
-		}
-		if resp.StatusCode() != 200 {
-			return nil, fmt.Errorf("fetch markets: status %d", resp.StatusCode())
+			return nil, fmt.Errorf("fetch markets page offset=%d: %w", offset, err)
 		}
 
 		allMarkets = append(allMarkets, page...)
@@ -183,23 +143,14 @@ func (s *Scanner) fetchMarkets(ctx context.Context) ([]GammaMarket, error) {
 }
 
 // filterMarkets applies hard filters to eliminate unsuitable markets:
-// inactive, closed, not accepting orders, no order book, optional include filters,
-// excluded slugs/keywords, insufficient liquidity/volume/spread, end date too near
-// or too far, missing token IDs.
-func (s *Scanner) filterMarkets(markets []GammaMarket) []GammaMarket {
+// inactive, closed, optional include filters, excluded slugs/keywords, end date
+// too near or too far.
+func (s *Scanner) filterMarkets(markets []types.USMarket) []types.USMarket {
 	excluded := make(map[string]bool)
 	for _, slug := range s.cfg.ExcludeSlugs {
 		slug = strings.ToLower(strings.TrimSpace(slug))
 		if slug != "" {
 			excluded[slug] = true
-		}
-	}
-
-	includeConditionIDs := make(map[string]bool)
-	for _, conditionID := range s.cfg.IncludeConditionIDs {
-		conditionID = strings.ToLower(strings.TrimSpace(conditionID))
-		if conditionID != "" {
-			includeConditionIDs[conditionID] = true
 		}
 	}
 
@@ -227,23 +178,22 @@ func (s *Scanner) filterMarkets(markets []GammaMarket) []GammaMarket {
 		}
 	}
 
-	hasIncludeFilter := len(includeConditionIDs) > 0 || len(includeSlugs) > 0 || len(includeKeywords) > 0
+	hasIncludeFilter := len(includeSlugs) > 0 || len(includeKeywords) > 0
 
 	now := time.Now()
 	maxEnd := now.AddDate(0, 0, s.cfg.MaxEndDateDays)
 
-	var result []GammaMarket
+	var result []types.USMarket
 	for _, m := range markets {
-		if !m.Active || m.Closed || !m.AcceptingOrders || !m.EnableOrderBook {
+		if !m.Active || m.Closed {
 			continue
 		}
 
 		slugLower := strings.ToLower(m.Slug)
 		questionLower := strings.ToLower(m.Question)
-		conditionLower := strings.ToLower(m.ConditionID)
 
 		if hasIncludeFilter {
-			matched := includeConditionIDs[conditionLower] || includeSlugs[slugLower]
+			matched := includeSlugs[slugLower]
 			if !matched {
 				for _, kw := range includeKeywords {
 					if strings.Contains(slugLower, kw) || strings.Contains(questionLower, kw) {
@@ -271,20 +221,6 @@ func (s *Scanner) filterMarkets(markets []GammaMarket) []GammaMarket {
 			continue
 		}
 
-		// Parse liquidity
-		liquidity, _ := strconv.ParseFloat(m.Liquidity, 64)
-		if liquidity < s.cfg.MinLiquidity {
-			continue
-		}
-
-		if m.Volume24hr < s.cfg.MinVolume24h {
-			continue
-		}
-
-		if m.Spread < s.cfg.MinSpread {
-			continue
-		}
-
 		// Check end date (reject unparseable dates)
 		if m.EndDate != "" {
 			endDate, err := time.Parse(time.RFC3339, m.EndDate)
@@ -296,32 +232,109 @@ func (s *Scanner) filterMarkets(markets []GammaMarket) []GammaMarket {
 			}
 		}
 
-		// Ensure we have token IDs
-		if m.ClobTokenIds == "" {
-			continue
-		}
-
 		result = append(result, m)
 	}
 
 	return result
 }
 
-// rankMarkets scores and sorts markets by opportunity quality.
-// score = spread × √volume × liquidityFactor, where liquidityFactor
-// is capped at 1.0 (10k USD liquidity saturates the bonus).
-func (s *Scanner) rankMarkets(markets []GammaMarket) []types.MarketAllocation {
-	type scored struct {
-		market GammaMarket
-		score  float64
+// rankWithBBO fetches BBO for each filtered market concurrently and ranks by spread.
+// score = spread × bidDepth × askDepth (markets with wider spreads and deeper
+// books are better MM opportunities).
+//
+// To avoid spending 40+ seconds on sequential HTTP calls when 200+ markets
+// match the keyword filter, we:
+//   1. Cap the number of BBO fetches to maxBBOFetches (e.g. 30).
+//   2. Use a bounded worker pool (10 goroutines) for concurrency.
+//   3. Apply a per-scan timeout (30s) so we never block the engine.
+func (s *Scanner) rankWithBBO(ctx context.Context, markets []types.USMarket) []types.MarketAllocation {
+	const (
+		maxBBOFetches = 30 // don't BBO-check more than this many markets
+		workerCount   = 10 // concurrent BBO fetchers
+		scanTimeout   = 30 * time.Second
+	)
+
+	// Cap the candidates — prefer diversity: take a random-ish sample
+	// by just truncating (they're already in API order which is effectively
+	// random across market families).
+	candidates := markets
+	if len(candidates) > maxBBOFetches {
+		s.logger.Info("capping BBO fetches", "total_filtered", len(candidates), "cap", maxBBOFetches)
+		candidates = candidates[:maxBBOFetches]
 	}
 
+	type scored struct {
+		market  types.USMarket
+		bestBid float64
+		bestAsk float64
+		spread  float64
+		score   float64
+	}
+
+	scanCtx, scanCancel := context.WithTimeout(ctx, scanTimeout)
+	defer scanCancel()
+
+	// Fan-out: send markets to a work channel
+	workCh := make(chan types.USMarket, len(candidates))
+	for _, m := range candidates {
+		workCh <- m
+	}
+	close(workCh)
+
+	// Fan-in: collect results
+	resultCh := make(chan scored, len(candidates))
+
+	var wg sync.WaitGroup
+	for i := 0; i < workerCount && i < len(candidates); i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for m := range workCh {
+				if scanCtx.Err() != nil {
+					return
+				}
+				bbo, err := s.client.GetBBO(scanCtx, m.Slug)
+				if err != nil {
+					s.logger.Debug("BBO fetch failed", "slug", m.Slug, "error", err)
+					continue
+				}
+
+				bid := parseFloat(bbo.MarketData.BestBid.Value)
+				ask := parseFloat(bbo.MarketData.BestAsk.Value)
+				if bid <= 0 || ask <= 0 || ask <= bid {
+					continue
+				}
+
+				spread := ask - bid
+				if spread < s.cfg.MinSpread {
+					continue
+				}
+
+				depthFactor := float64(bbo.MarketData.BidDepth+bbo.MarketData.AskDepth) / 2.0
+				if depthFactor < 1 {
+					depthFactor = 1
+				}
+
+				resultCh <- scored{
+					market:  m,
+					bestBid: bid,
+					bestAsk: ask,
+					spread:  spread,
+					score:   spread * depthFactor,
+				}
+			}
+		}()
+	}
+
+	// Wait for all workers then close results
+	go func() {
+		wg.Wait()
+		close(resultCh)
+	}()
+
 	var scoredMarkets []scored
-	for _, m := range markets {
-		liquidity, _ := strconv.ParseFloat(m.Liquidity, 64)
-		liquidityFactor := math.Min(liquidity/10000.0, 1.0)
-		score := m.Spread * math.Sqrt(m.Volume24hr) * liquidityFactor
-		scoredMarkets = append(scoredMarkets, scored{market: m, score: score})
+	for r := range resultCh {
+		scoredMarkets = append(scoredMarkets, r)
 	}
 
 	sort.Slice(scoredMarkets, func(i, j int) bool {
@@ -331,7 +344,7 @@ func (s *Scanner) rankMarkets(markets []GammaMarket) []types.MarketAllocation {
 	result := make([]types.MarketAllocation, len(scoredMarkets))
 	for i, sm := range scoredMarkets {
 		result[i] = types.MarketAllocation{
-			Market:         convertToMarketInfo(sm.market),
+			Market:         convertToMarketInfo(sm.market, sm.bestBid, sm.bestAsk, sm.spread),
 			MaxPositionUSD: s.riskCfg.MaxPositionPerMarket,
 			Score:          sm.score,
 		}
@@ -340,69 +353,53 @@ func (s *Scanner) rankMarkets(markets []GammaMarket) []types.MarketAllocation {
 	return result
 }
 
-// convertToMarketInfo transforms a Gamma API response into the internal
-// MarketInfo type used throughout the bot. It parses JSON-encoded token IDs,
-// maps the numeric tick size to the TickSize enum, and converts string
-// fields to their typed equivalents.
-func convertToMarketInfo(gm GammaMarket) types.MarketInfo {
-	liquidity, _ := strconv.ParseFloat(gm.Liquidity, 64)
-
-	// Parse token IDs from JSON array string like "[\"id1\",\"id2\"]"
-	var tokenIDs []string
-	if gm.ClobTokenIds != "" {
-		// Simple parsing for ["id1","id2"]
-		var ids []string
-		if err := parseJSONArray(gm.ClobTokenIds, &ids); err == nil {
-			tokenIDs = ids
-		}
-	}
-
-	var yesToken, noToken string
-	if len(tokenIDs) >= 2 {
-		yesToken = tokenIDs[0]
-		noToken = tokenIDs[1]
-	}
-
+// convertToMarketInfo transforms a US API USMarket into the internal
+// MarketInfo type used throughout the bot. The slug serves as the primary
+// identifier in the US API: ConditionID, YesTokenID, and NoTokenID are all
+// set to the slug (the exchange layer routes orders by slug).
+// bestBid, bestAsk, and spread are provided from the BBO fetch.
+func convertToMarketInfo(m types.USMarket, bestBid, bestAsk, spread float64) types.MarketInfo {
 	var tickSize types.TickSize
 	switch {
-	case gm.OrderPriceMinTickSize == 0.1:
+	case m.OrderPriceMinTickSize == 0.1:
 		tickSize = types.Tick01
-	case gm.OrderPriceMinTickSize == 0.001:
+	case m.OrderPriceMinTickSize == 0.001:
 		tickSize = types.Tick0001
-	case gm.OrderPriceMinTickSize == 0.0001:
+	case m.OrderPriceMinTickSize == 0.0001:
 		tickSize = types.Tick00001
 	default:
 		tickSize = types.Tick001
 	}
 
-	endDate, _ := time.Parse(time.RFC3339, gm.EndDate)
+	endDate, _ := time.Parse(time.RFC3339, m.EndDate)
 
 	return types.MarketInfo{
-		ID:               gm.ID,
-		ConditionID:      gm.ConditionID,
-		Slug:             gm.Slug,
-		Question:         gm.Question,
-		YesTokenID:       yesToken,
-		NoTokenID:        noToken,
-		TickSize:         tickSize,
-		MinOrderSize:     gm.OrderMinSize,
-		NegRisk:          gm.NegRisk,
-		Active:           gm.Active,
-		Closed:           gm.Closed,
-		AcceptingOrders:  gm.AcceptingOrders,
-		EndDate:          endDate,
-		Liquidity:        liquidity,
-		Volume24h:        gm.Volume24hr,
-		BestBid:          gm.BestBid,
-		BestAsk:          gm.BestAsk,
-		Spread:           gm.Spread,
-		LastTradePrice:   gm.LastTradePrice,
-		RewardsMinSize:   gm.RewardsMinSize,
-		RewardsMaxSpread: gm.RewardsMaxSpread,
+		ID:              m.ID,
+		ConditionID:     m.Slug, // slug is the universal identifier in the US API
+		Slug:            m.Slug,
+		Question:        m.Question,
+		YesTokenID:      m.Slug, // exchange layer uses slug to identify orders
+		NoTokenID:       m.Slug, // single-instrument model; book tracks one side
+		TickSize:        tickSize,
+		MinOrderSize:    m.OrderMinSize,
+		NegRisk:         false,  // always false for US API
+		Active:          m.Active,
+		Closed:          m.Closed,
+		AcceptingOrders: true,   // if it's active and not closed, it accepts orders
+		EndDate:         endDate,
+		Liquidity:       m.LiquidityNum,
+		Volume24h:       m.Volume24hr,
+		BestBid:         bestBid,
+		BestAsk:         bestAsk,
+		Spread:          spread,
+		LastTradePrice:  0,       // not available in market list; populated later by book data
+		RewardsMinSize:   0,      // US API does not expose rewards metadata yet
+		RewardsMaxSpread: 0,      // US API does not expose rewards metadata yet
 	}
 }
 
-// parseJSONArray parses a JSON array string into a string slice.
-func parseJSONArray(s string, out *[]string) error {
-	return json.Unmarshal([]byte(s), out)
+// parseFloat is a helper that parses a decimal string to float64, returning 0 on error.
+func parseFloat(s string) float64 {
+	f, _ := strconv.ParseFloat(s, 64)
+	return f
 }
