@@ -1,64 +1,48 @@
-dry_run: true  # if true, no real orders will be placed
+dry_run: true  # set to false for live trading
 
-wallet:
-  private_key: ""           # set via POLY_PRIVATE_KEY env
-  signature_type: 1         # 0=EOA, 1=POLY_PROXY, 2=GNOSIS_SAFE
-  funder_address: ""        # set via config or env - your proxy wallet address from polymarket.com/settings
-  chain_id: 137             # Polygon mainnet
+auth:
+  api_key_id: ""          # set via POLY_API_KEY_ID env (UUID from polymarket.us/developer)
+  private_key_b64: ""     # set via POLY_PRIVATE_KEY_B64 env (base64-encoded Ed25519 private key)
 
 api:
-  clob_base_url: "https://clob.polymarket.com"
-  gamma_base_url: "https://gamma-api.polymarket.com"
-  ws_market_url: "wss://ws-subscriptions-clob.polymarket.com/ws/market"
-  ws_user_url: "wss://ws-subscriptions-clob.polymarket.com/ws/user"
-  api_key: ""               # set via POLY_API_KEY env
-  secret: ""                # set via POLY_API_SECRET env
-  passphrase: ""            # set via POLY_PASSPHRASE env
+  base_url: "https://api.polymarket.us"
+  ws_market_url: "wss://api.polymarket.us/v1/ws/markets"
+  ws_private_url: "wss://api.polymarket.us/v1/ws/private"
 
 strategy:
-  gamma: 0.1                # risk aversion (higher = tighter inventory control)
-  sigma: 0.5                # annualized vol estimate
-  k: 1.5                    # order arrival intensity
-  t: 0.00274                # time horizon (~1 day in years = 1/365)
-  default_spread_bps: 200   # 2% minimum spread
-  order_size_usd: 1.0       # quote size per side in USDC (minimal for testing)
-  refresh_interval: 5s      # how often to re-quote
-  stale_book_timeout: 30s   # cancel quotes if no book update
+  gamma: 0.20               # higher risk aversion for game-day markets (fast moves)
+  sigma: 0.6                # higher vol — game-day prices swing on live scores
+  k: 1.5                    # higher order arrival — game markets are more active
+  t: 0.00137                # shorter horizon (~0.5 day) — games resolve today
+  default_spread_bps: 100   # 1% minimum spread — need to be AT the BBO to get filled
+  order_size_usd: 3.0       # $3 per side — spread across more markets
+  refresh_interval: 10s     # faster refresh for game-day markets
+  stale_book_timeout: 90s   # shorter timeout — game markets should be active
 
-  # Phase 1: Toxic flow detection
-  flow_window: 60s                    # Track fills in last 60 seconds
-  flow_toxicity_threshold: 0.6        # Score > 0.6 triggers spread widening
-  flow_cooldown_period: 120s          # Stay wide for 2 minutes after toxic flow
-  flow_max_spread_multiplier: 3.0     # Max 3x spread widening
+  # Toxic flow detection
+  flow_window: 60s                    # Tighter window — game-day flow moves fast
+  flow_toxicity_threshold: 0.5        # Lower threshold — be cautious on game day
+  flow_cooldown_period: 120s          # 2 min — game-day markets recover faster
+  flow_max_spread_multiplier: 2.5     # Max 2.5x spread widening
 
 risk:
-  max_position_per_market: 10.0
-  max_global_exposure: 20.0
-  max_markets_active: 1
-  kill_switch_drop_pct: 0.15   # 15% price move triggers kill
+  max_position_per_market: 3.0    # $3 max per market — spread risk across more games
+  max_global_exposure: 10.0       # $10 total
+  max_markets_active: 5           # 5 game markets active simultaneously
+  kill_switch_drop_pct: 0.30      # 30% price move triggers kill (game results swing hard)
   kill_switch_window_sec: 60
-  max_daily_loss: 5.0
+  max_daily_loss: 3.0             # $3 daily loss limit (30% of capital)
   cooldown_after_kill: 5m
 
 scanner:
-  poll_interval: 60s
-  min_liquidity: 1.0         # $1 minimum liquidity for tiny markets
-  min_volume_24h: 1.0        # $1 minimum volume
-  min_spread: 0.001          # 0.1% minimum spread
-  max_end_date_days: 1       # Only today's markets
-  include_condition_ids: []  # optional hard allowlist: exact condition IDs to trade
-  include_slugs: []          # optional hard allowlist: exact market slugs to trade
-  include_keywords:          # BTC-only market families (Phase 1)
-    - "bitcoin-up-or-down-on-"
-    - "bitcoin-up-or-down-"
-    - "bitcoin-above-on-"
-    - "bitcoin-price-on-"
-    - "what-price-will-bitcoin-hit-"
-  exclude_keywords:          # avoid thin short-horizon contracts
-    - "btc-updown-5m"
-    - "btc-updown-15m"
-    - " in 5m"
-    - " in 15m"
+  poll_interval: 60s              # scan every 1 min — game markets are dynamic
+  min_liquidity: 0                # US API doesn't provide inline liquidity data
+  min_volume_24h: 0               # US API doesn't provide inline volume data
+  min_spread: 0.005           # 0.5% minimum — tight spreads are fine, we want fills
+  max_end_date_days: 30           # only near-term markets
+  include_slugs: []               # leave empty to let keyword matching handle it
+  include_keywords: []              # e.g. ["aec-nba-det-orl-2026-03-01"] — filter by market slug keywords
+  exclude_keywords: []            # nothing to exclude
   exclude_slugs: []
 
 store:
