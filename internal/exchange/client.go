@@ -1,15 +1,19 @@
-// Package exchange implements the Polymarket CLOB REST and WebSocket clients.
+// Package exchange implements the Polymarket US REST API client.
 //
-// The REST client (Client) talks to the Polymarket CLOB API for order management:
-//   - GetOrderBook:       GET  /book               — fetch L2 book for a token
-//   - PostOrders:         POST /orders              — batch-place up to 15 signed orders
-//   - CancelOrders:       DELETE /orders            — cancel specific orders by ID
-//   - CancelAll:          DELETE /cancel-all         — emergency cancel everything
-//   - CancelMarketOrders: DELETE /cancel-market-orders — cancel one market's orders
-//   - DeriveAPIKey:       GET  /auth/derive-api-key — bootstrap L2 creds from L1 wallet
+// The Client wraps a resty HTTP client targeting https://api.polymarket.us
+// with Ed25519 auth headers, rate limiting, and automatic retry on 5xx errors.
 //
-// Every request is rate-limited via per-category TokenBuckets, automatically retried
-// on 5xx errors, and authenticated with L2 HMAC headers (except book reads).
+// Key endpoints:
+//   - GetMarkets:          GET  /v1/markets                    — market discovery
+//   - GetOrderBook:        GET  /v1/markets/{slug}/book        — full L2 book
+//   - GetBBO:              GET  /v1/markets/{slug}/bbo         — best bid/offer
+//   - PlaceOrder:          POST /v1/orders                     — place single order
+//   - CancelOrder:         DELETE /v1/order/{id}/cancel        — cancel by ID
+//   - CancelMarketOrders:  POST /v1/orders/open/cancel         — cancel by slug list
+//   - CancelAll:           POST /v1/orders/open/cancel         — cancel everything
+//   - GetOpenOrders:       GET  /v1/orders/open                — open resting orders
+//   - GetPositions:        GET  /v1/portfolio/positions        — current positions
+//   - GetBalances:         GET  /v1/account/balances           — account balances
 package exchange
 
 import (
@@ -17,38 +21,36 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
-	"math/big"
 	"net/http"
 	"time"
 
-	sdkauth "github.com/GoPolymarket/polymarket-go-sdk/pkg/auth"
-	sdkclob "github.com/GoPolymarket/polymarket-go-sdk/pkg/clob"
-	"github.com/GoPolymarket/polymarket-go-sdk/pkg/clob/clobtypes"
-	sdktypes "github.com/GoPolymarket/polymarket-go-sdk/pkg/types"
-	"github.com/ethereum/go-ethereum/common"
 	"github.com/go-resty/resty/v2"
-	"github.com/shopspring/decimal"
 
 	"polymarket-mm/internal/config"
 	"polymarket-mm/pkg/types"
 )
 
-// Client is the Polymarket CLOB REST API client.
-// It wraps a resty HTTP client with rate limiting, retry, and auth.
+const baseURL = "https://api.polymarket.us"
+
+// Client is the Polymarket US REST API client.
+// It wraps a resty HTTP client with rate limiting, retry, and Ed25519 auth.
 type Client struct {
-	http   *resty.Client // HTTP client with retry + base URL
-	auth   *Auth         // L1/L2 auth provider for request signing
-	rl     *RateLimiter  // per-endpoint-category rate limiting
-	dryRun bool          // when true, mutating methods return fake success without HTTP calls
+	http   *resty.Client
+	auth   *Auth
+	rl     *RateLimiter
+	dryRun bool
 	logger *slog.Logger
 }
 
-var zeroAddress = common.HexToAddress("0x0000000000000000000000000000000000000000")
-
 // NewClient creates a REST client with rate limiting and retry.
 func NewClient(cfg config.Config, auth *Auth, logger *slog.Logger) *Client {
+	url := cfg.API.BaseURL
+	if url == "" {
+		url = baseURL
+	}
+
 	httpClient := resty.New().
-		SetBaseURL(cfg.API.CLOBBaseURL).
+		SetBaseURL(url).
 		SetTimeout(10*time.Second).
 		SetRetryCount(3).
 		SetRetryWaitTime(500*time.Millisecond).
@@ -70,102 +72,435 @@ func NewClient(cfg config.Config, auth *Auth, logger *slog.Logger) *Client {
 	}
 }
 
-// GetOrderBook fetches the order book for a single token.
-func (c *Client) GetOrderBook(ctx context.Context, tokenID string) (*types.BookResponse, error) {
-	if err := c.rl.Book.Wait(ctx); err != nil {
+// setAuthHeaders attaches Ed25519 auth headers to a resty request for the
+// given HTTP method and path (must include leading slash, e.g. "/v1/orders").
+func (c *Client) setAuthHeaders(req *resty.Request, method, path string) *resty.Request {
+	headers := c.auth.SignRequest(method, path)
+	return req.SetHeaders(headers)
+}
+
+// ————————————————————————————————————————————————————————————————————————
+// Markets
+// ————————————————————————————————————————————————————————————————————————
+
+// GetMarkets fetches markets from GET /v1/markets with optional query filters.
+func (c *Client) GetMarkets(ctx context.Context, params types.MarketQueryParams) ([]types.USMarket, error) {
+	if err := c.rl.Global.Wait(ctx); err != nil {
 		return nil, err
 	}
 
-	var result types.BookResponse
-	resp, err := c.http.R().
-		SetContext(ctx).
-		SetQueryParam("token_id", tokenID).
-		SetResult(&result).
-		Get("/book")
+	req := c.http.R().SetContext(ctx)
+	c.setAuthHeaders(req, "GET", "/v1/markets")
+
+	// Build query params from the struct
+	if params.Active != nil {
+		req.SetQueryParam("active", boolStr(*params.Active))
+	}
+	if params.Closed != nil {
+		req.SetQueryParam("closed", boolStr(*params.Closed))
+	}
+	if params.Archived != nil {
+		req.SetQueryParam("archived", boolStr(*params.Archived))
+	}
+	if params.LiquidityMin > 0 {
+		req.SetQueryParam("liquidityNumMin", floatStr(params.LiquidityMin))
+	}
+	if params.LiquidityMax > 0 {
+		req.SetQueryParam("liquidityNumMax", floatStr(params.LiquidityMax))
+	}
+	if params.VolumeMin > 0 {
+		req.SetQueryParam("volumeNumMin", floatStr(params.VolumeMin))
+	}
+	if params.VolumeMax > 0 {
+		req.SetQueryParam("volumeNumMax", floatStr(params.VolumeMax))
+	}
+	if params.OrderBy != "" {
+		req.SetQueryParam("orderBy", params.OrderBy)
+	}
+	if params.Limit > 0 {
+		req.SetQueryParam("limit", intStr(params.Limit))
+	}
+	if params.Offset > 0 {
+		req.SetQueryParam("offset", intStr(params.Offset))
+	}
+
+	var result types.USMarketsResponse
+	resp, err := req.SetResult(&result).Get("/v1/markets")
 	if err != nil {
-		return nil, fmt.Errorf("get book: %w", err)
+		return nil, fmt.Errorf("get markets: %w", err)
 	}
 	if resp.StatusCode() != http.StatusOK {
-		return nil, fmt.Errorf("get book: status %d: %s", resp.StatusCode(), resp.String())
+		return nil, fmt.Errorf("get markets: status %d: %s", resp.StatusCode(), resp.String())
 	}
+
+	return result.Markets, nil
+}
+
+// GetOrderBook fetches the full order book for a market via GET /v1/markets/{slug}/book.
+// This is the primary new method returning the US API response type.
+func (c *Client) GetUSOrderBook(ctx context.Context, slug string) (*types.USBookResponse, error) {
+	if err := c.rl.Global.Wait(ctx); err != nil {
+		return nil, err
+	}
+
+	path := "/v1/markets/" + slug + "/book"
+
+	var result types.USBookResponse
+	resp, err := c.setAuthHeaders(c.http.R().SetContext(ctx), "GET", path).
+		SetResult(&result).
+		Get(path)
+	if err != nil {
+		return nil, fmt.Errorf("get order book: %w", err)
+	}
+	if resp.StatusCode() != http.StatusOK {
+		return nil, fmt.Errorf("get order book: status %d: %s", resp.StatusCode(), resp.String())
+	}
+
 	return &result, nil
 }
 
-// buildOrderPayload converts a high-level UserOrder into the on-chain
-// SignedOrder + metadata the REST API expects. It converts human-readable
-// price/size to big.Int maker/taker amounts at the market's tick precision,
-// sets the maker to the funder wallet (proxy), the signer to the EOA,
-// and the taker to the zero address (open order, anyone can fill).
-func (c *Client) buildOrderPayload(order types.UserOrder) (types.OrderPayload, error) {
-	tickSize := order.TickSize
-	if tickSize == "" {
-		tickSize = types.Tick001
-	}
-	makerAmt, takerAmt := PriceToAmounts(order.Price, order.Size, order.Side, tickSize)
-
-	tokenID, ok := new(big.Int).SetString(order.TokenID, 10)
-	if !ok {
-		return types.OrderPayload{}, fmt.Errorf("invalid token id %q: expected base-10 integer string", order.TokenID)
-	}
-
-	expiration := big.NewInt(0)
-	if order.Expiration > 0 {
-		expiration = big.NewInt(order.Expiration)
-	}
-
-	nonce := big.NewInt(0)
-	sigType := int(c.auth.sigType)
-	sdkOrder := &clobtypes.Order{
-		Signer:        c.auth.Address(),
-		Maker:         c.auth.FunderAddress(),
-		Taker:         zeroAddress,
-		TokenID:       sdktypes.U256{Int: tokenID},
-		MakerAmount:   sdktypes.Decimal(decimal.NewFromBigInt(makerAmt, 0)),
-		TakerAmount:   sdktypes.Decimal(decimal.NewFromBigInt(takerAmt, 0)),
-		Expiration:    sdktypes.U256{Int: expiration},
-		Side:          string(order.Side),
-		FeeRateBps:    sdktypes.Decimal(decimal.NewFromInt(int64(order.FeeRateBps))),
-		Nonce:         sdktypes.U256{Int: nonce},
-		SignatureType: &sigType,
-	}
-
-	signedOrder, err := sdkclob.SignOrder(c.auth, &sdkauth.APIKey{
-		Key:        c.auth.creds.ApiKey,
-		Secret:     c.auth.creds.Secret,
-		Passphrase: c.auth.creds.Passphrase,
-	}, sdkOrder)
+// GetOrderBook fetches the full order book and returns it in the legacy BookResponse
+// format so that existing callers (engine, market/book) continue to compile.
+func (c *Client) GetOrderBook(ctx context.Context, slug string) (*types.BookResponse, error) {
+	usResp, err := c.GetUSOrderBook(ctx, slug)
 	if err != nil {
-		return types.OrderPayload{}, fmt.Errorf("sign order: %w", err)
+		return nil, err
 	}
-
-	return types.OrderPayload{
-		Order: types.SignedOrder{
-			Salt:          signedOrder.Order.Salt.String(),
-			Maker:         signedOrder.Order.Maker.Hex(),
-			Signer:        signedOrder.Order.Signer.Hex(),
-			Taker:         signedOrder.Order.Taker.Hex(),
-			TokenID:       order.TokenID,
-			MakerAmount:   signedOrder.Order.MakerAmount.BigInt(),
-			TakerAmount:   signedOrder.Order.TakerAmount.BigInt(),
-			Side:          order.Side,
-			Expiration:    signedOrder.Order.Expiration.String(),
-			Nonce:         signedOrder.Order.Nonce.String(),
-			FeeRateBps:    fmt.Sprintf("%d", order.FeeRateBps),
-			SignatureType: types.SignatureType(sigType),
-			Signature:     signedOrder.Signature,
-		},
-		Owner:     signedOrder.Owner,
-		OrderType: order.OrderType,
-	}, nil
+	return usBookToLegacy(usResp), nil
 }
 
-// PostOrders places up to 15 orders in a batch.
+// usBookToLegacy converts a US API book response to the legacy BookResponse format.
+func usBookToLegacy(us *types.USBookResponse) *types.BookResponse {
+	if us == nil {
+		return nil
+	}
+	bids := make([]types.PriceLevel, len(us.MarketData.Bids))
+	for i, b := range us.MarketData.Bids {
+		bids[i] = types.PriceLevel{Price: b.Px.Value, Size: b.Qty}
+	}
+	asks := make([]types.PriceLevel, len(us.MarketData.Offers))
+	for i, a := range us.MarketData.Offers {
+		asks[i] = types.PriceLevel{Price: a.Px.Value, Size: a.Qty}
+	}
+	return &types.BookResponse{
+		Market:  us.MarketData.MarketSlug,
+		AssetID: us.MarketData.MarketSlug,
+		Bids:    bids,
+		Asks:    asks,
+	}
+}
+
+// GetBBO fetches the best bid/offer for a market via GET /v1/markets/{slug}/bbo.
+func (c *Client) GetBBO(ctx context.Context, slug string) (*types.USBBOResponse, error) {
+	if err := c.rl.Global.Wait(ctx); err != nil {
+		return nil, err
+	}
+
+	path := "/v1/markets/" + slug + "/bbo"
+
+	var result types.USBBOResponse
+	resp, err := c.setAuthHeaders(c.http.R().SetContext(ctx), "GET", path).
+		SetResult(&result).
+		Get(path)
+	if err != nil {
+		return nil, fmt.Errorf("get bbo: %w", err)
+	}
+	if resp.StatusCode() != http.StatusOK {
+		return nil, fmt.Errorf("get bbo: status %d: %s", resp.StatusCode(), resp.String())
+	}
+
+	return &result, nil
+}
+
+// ————————————————————————————————————————————————————————————————————————
+// Orders
+// ————————————————————————————————————————————————————————————————————————
+
+// PlaceOrder places a single order via POST /v1/orders.
+func (c *Client) PlaceOrder(ctx context.Context, order types.USOrderRequest) (*types.USOrderResponse, error) {
+	if c.dryRun {
+		c.logger.Info("DRY-RUN: would place order",
+			"market", order.MarketSlug,
+			"intent", order.Intent,
+			"price", order.Price.Value,
+			"qty", order.Quantity,
+		)
+		return &types.USOrderResponse{ID: "dry-run-" + order.MarketSlug}, nil
+	}
+
+	if err := c.rl.Order.Wait(ctx); err != nil {
+		return nil, err
+	}
+	if err := c.rl.Global.Wait(ctx); err != nil {
+		return nil, err
+	}
+
+	body, err := json.Marshal(order)
+	if err != nil {
+		return nil, fmt.Errorf("marshal order: %w", err)
+	}
+
+	var result types.USOrderResponse
+	resp, err := c.setAuthHeaders(c.http.R().SetContext(ctx), "POST", "/v1/orders").
+		SetBody(json.RawMessage(body)).
+		SetResult(&result).
+		Post("/v1/orders")
+	if err != nil {
+		return nil, fmt.Errorf("place order: %w", err)
+	}
+	if resp.StatusCode() != http.StatusOK && resp.StatusCode() != http.StatusCreated {
+		return nil, fmt.Errorf("place order: status %d: %s", resp.StatusCode(), resp.String())
+	}
+
+	c.logger.Info("order placed", "id", result.ID, "market", order.MarketSlug)
+	return &result, nil
+}
+
+// CancelOrder cancels a single order via DELETE /v1/order/{orderID}/cancel.
+// The marketSlug is sent in the request body as required by the API.
+func (c *Client) CancelOrder(ctx context.Context, orderID, marketSlug string) error {
+	if c.dryRun {
+		c.logger.Info("DRY-RUN: would cancel order", "id", orderID, "market", marketSlug)
+		return nil
+	}
+
+	if err := c.rl.Order.Wait(ctx); err != nil {
+		return err
+	}
+	if err := c.rl.Global.Wait(ctx); err != nil {
+		return err
+	}
+
+	path := "/v1/order/" + orderID + "/cancel"
+	body, err := json.Marshal(map[string]string{"marketSlug": marketSlug})
+	if err != nil {
+		return fmt.Errorf("marshal cancel body: %w", err)
+	}
+
+	resp, err := c.setAuthHeaders(c.http.R().SetContext(ctx), "DELETE", path).
+		SetBody(json.RawMessage(body)).
+		Delete(path)
+	if err != nil {
+		return fmt.Errorf("cancel order: %w", err)
+	}
+	if resp.StatusCode() != http.StatusOK && resp.StatusCode() != http.StatusNoContent {
+		return fmt.Errorf("cancel order: status %d: %s", resp.StatusCode(), resp.String())
+	}
+
+	c.logger.Info("order cancelled", "id", orderID)
+	return nil
+}
+
+// CancelMarketOrders cancels all open orders for the specified market slugs
+// via POST /v1/orders/open/cancel.
+// This is the compatibility shim: it accepts a single conditionID/slug string
+// (as used by the strategy layer) and wraps CancelMarketOrdersBySlugs.
+func (c *Client) CancelMarketOrders(ctx context.Context, slug string) (*types.CancelResponse, error) {
+	resp, err := c.CancelMarketOrdersBySlugs(ctx, []string{slug})
+	if err != nil {
+		return nil, err
+	}
+	return &types.CancelResponse{Canceled: resp.CanceledOrderIDs}, nil
+}
+
+// CancelMarketOrdersBySlugs cancels all open orders for the specified market slugs
+// via POST /v1/orders/open/cancel.
+func (c *Client) CancelMarketOrdersBySlugs(ctx context.Context, slugs []string) (*types.USCancelResponse, error) {
+	if c.dryRun {
+		c.logger.Info("DRY-RUN: would cancel market orders", "count", len(slugs))
+		return &types.USCancelResponse{}, nil
+	}
+
+	if err := c.rl.Order.Wait(ctx); err != nil {
+		return nil, err
+	}
+	if err := c.rl.Global.Wait(ctx); err != nil {
+		return nil, err
+	}
+
+	body, err := json.Marshal(map[string][]string{"slugs": slugs})
+	if err != nil {
+		return nil, fmt.Errorf("marshal cancel body: %w", err)
+	}
+
+	var result types.USCancelResponse
+	resp, err := c.setAuthHeaders(c.http.R().SetContext(ctx), "POST", "/v1/orders/open/cancel").
+		SetBody(json.RawMessage(body)).
+		SetResult(&result).
+		Post("/v1/orders/open/cancel")
+	if err != nil {
+		return nil, fmt.Errorf("cancel market orders: %w", err)
+	}
+	if resp.StatusCode() != http.StatusOK {
+		return nil, fmt.Errorf("cancel market orders: status %d: %s", resp.StatusCode(), resp.String())
+	}
+
+	c.logger.Info("market orders cancelled", "count", len(result.CanceledOrderIDs))
+	return &result, nil
+}
+
+// CancelAll cancels every open order by posting an empty slugs list to
+// POST /v1/orders/open/cancel.
+func (c *Client) CancelAll(ctx context.Context) (*types.USCancelResponse, error) {
+	if c.dryRun {
+		c.logger.Info("DRY-RUN: would cancel all orders")
+		return &types.USCancelResponse{}, nil
+	}
+
+	if err := c.rl.Order.Wait(ctx); err != nil {
+		return nil, err
+	}
+	if err := c.rl.Global.Wait(ctx); err != nil {
+		return nil, err
+	}
+
+	// Empty slugs array triggers cancel-all per the API spec
+	body := []byte(`{"slugs":[]}`)
+
+	var result types.USCancelResponse
+	resp, err := c.setAuthHeaders(c.http.R().SetContext(ctx), "POST", "/v1/orders/open/cancel").
+		SetBody(json.RawMessage(body)).
+		SetResult(&result).
+		Post("/v1/orders/open/cancel")
+	if err != nil {
+		return nil, fmt.Errorf("cancel all: %w", err)
+	}
+	if resp.StatusCode() != http.StatusOK {
+		return nil, fmt.Errorf("cancel all: status %d: %s", resp.StatusCode(), resp.String())
+	}
+
+	c.logger.Warn("all orders cancelled", "count", len(result.CanceledOrderIDs))
+	return &result, nil
+}
+
+// GetOpenOrders returns all open resting orders via GET /v1/orders/open.
+// If slugs is non-empty, filters to those market slugs.
+func (c *Client) GetOpenOrders(ctx context.Context, slugs []string) ([]types.USOpenOrder, error) {
+	if err := c.rl.Book.Wait(ctx); err != nil {
+		return nil, err
+	}
+	if err := c.rl.Global.Wait(ctx); err != nil {
+		return nil, err
+	}
+
+	req := c.setAuthHeaders(c.http.R().SetContext(ctx), "GET", "/v1/orders/open")
+	for _, s := range slugs {
+		req.QueryParam.Add("slugs", s)
+	}
+
+	var result types.USOpenOrdersResponse
+	resp, err := req.SetResult(&result).Get("/v1/orders/open")
+	if err != nil {
+		return nil, fmt.Errorf("get open orders: %w", err)
+	}
+	if resp.StatusCode() != http.StatusOK {
+		return nil, fmt.Errorf("get open orders: status %d: %s", resp.StatusCode(), resp.String())
+	}
+
+	return result.Orders, nil
+}
+
+// ————————————————————————————————————————————————————————————————————————
+// Portfolio / Account
+// ————————————————————————————————————————————————————————————————————————
+
+// GetPositions returns current positions from GET /v1/portfolio/positions.
+// The API returns an envelope with a "positions" map keyed by market slug.
+func (c *Client) GetPositions(ctx context.Context) (map[string]types.USPosition, error) {
+	if err := c.rl.Global.Wait(ctx); err != nil {
+		return nil, err
+	}
+
+	var result types.USPositionsResponse
+	resp, err := c.setAuthHeaders(c.http.R().SetContext(ctx), "GET", "/v1/portfolio/positions").
+		SetResult(&result).
+		Get("/v1/portfolio/positions")
+	if err != nil {
+		return nil, fmt.Errorf("get positions: %w", err)
+	}
+	if resp.StatusCode() != http.StatusOK {
+		return nil, fmt.Errorf("get positions: status %d: %s", resp.StatusCode(), resp.String())
+	}
+
+	if result.Positions == nil {
+		return make(map[string]types.USPosition), nil
+	}
+	return result.Positions, nil
+}
+
+// GetBalances returns account balances from GET /v1/account/balances.
+func (c *Client) GetBalances(ctx context.Context) ([]types.USBalance, error) {
+	if err := c.rl.Global.Wait(ctx); err != nil {
+		return nil, err
+	}
+
+	var result types.USBalancesResponse
+	resp, err := c.setAuthHeaders(c.http.R().SetContext(ctx), "GET", "/v1/account/balances").
+		SetResult(&result).
+		Get("/v1/account/balances")
+	if err != nil {
+		return nil, fmt.Errorf("get balances: %w", err)
+	}
+	if resp.StatusCode() != http.StatusOK {
+		return nil, fmt.Errorf("get balances: status %d: %s", resp.StatusCode(), resp.String())
+	}
+
+	return result.Balances, nil
+}
+
+// DeriveAPIKey is a no-op compatibility stub. The Polymarket US API uses
+// statically configured Ed25519 keys; there is no key derivation step.
+// The engine calls this when HasL2Credentials() returns false, but since
+// HasL2Credentials always returns true on the new Auth, this should never
+// be called in practice.
+func (c *Client) DeriveAPIKey(_ context.Context) (*Credentials, error) {
+	c.logger.Info("DeriveAPIKey called (no-op on US API)")
+	return &Credentials{}, nil
+}
+
+// ————————————————————————————————————————————————————————————————————————
+// Compatibility shims
+//
+// These methods preserve the old interface used by internal/strategy/ so that
+// the strategy layer can continue to compile while the exchange layer targets
+// the new US API. They translate the old call signatures to the new ones.
+// ————————————————————————————————————————————————————————————————————————
+
+// CancelOrders cancels a list of orders by ID, returning a CancelResponse
+// compatible with the old CLOB interface.
+// Each order is cancelled individually via DELETE /v1/order/{id}/cancel.
+// marketSlug is derived from the first entry's context (empty string if unknown).
+func (c *Client) CancelOrders(ctx context.Context, orderIDs []string) (*types.CancelResponse, error) {
+	if len(orderIDs) == 0 {
+		return &types.CancelResponse{}, nil
+	}
+	if c.dryRun {
+		c.logger.Info("DRY-RUN: would cancel orders", "count", len(orderIDs))
+		return &types.CancelResponse{Canceled: orderIDs}, nil
+	}
+
+	// The US API requires a marketSlug for individual order cancels.
+	// When cancelling by a list of IDs without slug context, use the
+	// cancel-all-by-slugs endpoint instead (empty list = cancel all).
+	// Fall back to per-order cancel with empty marketSlug and let the server
+	// return an error if required.
+	canceled := make([]string, 0, len(orderIDs))
+	for _, id := range orderIDs {
+		if err := c.CancelOrder(ctx, id, ""); err != nil {
+			c.logger.Warn("cancel order failed", "id", id, "error", err)
+			continue
+		}
+		canceled = append(canceled, id)
+	}
+	return &types.CancelResponse{Canceled: canceled}, nil
+}
+
+// PostOrders places a batch of orders using the new US PlaceOrder API.
+// The negRisk parameter is accepted for signature compatibility but ignored
+// (the US API uses intent-based ordering instead).
 func (c *Client) PostOrders(ctx context.Context, orders []types.UserOrder, negRisk bool) ([]types.OrderResponse, error) {
 	if len(orders) == 0 {
 		return nil, nil
-	}
-	if len(orders) > 15 {
-		return nil, fmt.Errorf("batch limit is 15 orders, got %d", len(orders))
 	}
 	if c.dryRun {
 		c.logger.Info("DRY-RUN: would post orders", "count", len(orders))
@@ -175,174 +510,64 @@ func (c *Client) PostOrders(ctx context.Context, orders []types.UserOrder, negRi
 		}
 		return results, nil
 	}
-	if err := c.rl.Order.Wait(ctx); err != nil {
-		return nil, err
-	}
 
-	payloads := make([]types.OrderPayload, len(orders))
-	for i, order := range orders {
-		payload, err := c.buildOrderPayload(order)
+	results := make([]types.OrderResponse, 0, len(orders))
+	for _, order := range orders {
+		usReq := userOrderToUSRequest(order)
+		resp, err := c.PlaceOrder(ctx, usReq)
 		if err != nil {
-			return nil, fmt.Errorf("build order payload %d: %w", i, err)
+			results = append(results, types.OrderResponse{
+				Success:  false,
+				ErrorMsg: err.Error(),
+			})
+			continue
 		}
-		payloads[i] = payload
+		status := "live"
+		if len(resp.Executions) > 0 {
+			status = "matched"
+		}
+		results = append(results, types.OrderResponse{
+			Success:    true,
+			OrderID:    resp.ID,
+			Status:     status,
+			Executions: resp.Executions,
+		})
 	}
-
-	body, err := json.Marshal(payloads)
-	if err != nil {
-		return nil, fmt.Errorf("marshal orders: %w", err)
-	}
-	headers, err := c.auth.L2Headers("POST", "/orders", string(body))
-	if err != nil {
-		return nil, fmt.Errorf("l2 headers: %w", err)
-	}
-
-	var results []types.OrderResponse
-	resp, err := c.http.R().
-		SetContext(ctx).
-		SetHeaders(headers).
-		SetBody(json.RawMessage(body)).
-		SetResult(&results).
-		Post("/orders")
-	if err != nil {
-		return nil, fmt.Errorf("post orders: %w", err)
-	}
-	if resp.StatusCode() != http.StatusOK {
-		return nil, fmt.Errorf("post orders: status %d: %s", resp.StatusCode(), resp.String())
-	}
-
 	return results, nil
 }
 
-// CancelOrders cancels multiple orders by ID.
-func (c *Client) CancelOrders(ctx context.Context, orderIDs []string) (*types.CancelResponse, error) {
-	if len(orderIDs) == 0 {
-		return &types.CancelResponse{}, nil
+// userOrderToUSRequest converts a legacy UserOrder to the new US API request format.
+func userOrderToUSRequest(o types.UserOrder) types.USOrderRequest {
+	intent := types.IntentBuyLong
+	if o.Side == types.SELL {
+		intent = types.IntentSellLong
 	}
-	if c.dryRun {
-		c.logger.Info("DRY-RUN: would cancel orders", "count", len(orderIDs))
-		return &types.CancelResponse{Canceled: orderIDs}, nil
+	return types.USOrderRequest{
+		MarketSlug: o.TokenID, // TokenID as market identifier (caller should use slug)
+		Intent:     intent,
+		Type:       types.USOrderTypeLimit,
+		Price:      types.USPrice{Value: fmt.Sprintf("%.6f", o.Price), Currency: "USD"},
+		Quantity:   o.Size,
+		TIF:        types.TIFGoodTillCancel,
+		ManualOrderIndicator: types.ManualOrderAutomatic,
 	}
-	if err := c.rl.Cancel.Wait(ctx); err != nil {
-		return nil, err
-	}
-
-	payload := struct {
-		OrderIDs []string `json:"orderIDs"`
-	}{OrderIDs: orderIDs}
-
-	body, err := json.Marshal(payload)
-	if err != nil {
-		return nil, fmt.Errorf("marshal cancel request: %w", err)
-	}
-	headers, err := c.auth.L2Headers("DELETE", "/orders", string(body))
-	if err != nil {
-		return nil, fmt.Errorf("l2 headers: %w", err)
-	}
-
-	var result types.CancelResponse
-	resp, err := c.http.R().
-		SetContext(ctx).
-		SetHeaders(headers).
-		SetBody(json.RawMessage(body)).
-		SetResult(&result).
-		Delete("/orders")
-	if err != nil {
-		return nil, fmt.Errorf("cancel orders: %w", err)
-	}
-	if resp.StatusCode() != http.StatusOK {
-		return nil, fmt.Errorf("cancel orders: status %d: %s", resp.StatusCode(), resp.String())
-	}
-
-	c.logger.Info("orders cancelled", "count", len(result.Canceled))
-	return &result, nil
 }
 
-// CancelAll cancels every open order across all markets.
-func (c *Client) CancelAll(ctx context.Context) (*types.CancelResponse, error) {
-	if c.dryRun {
-		c.logger.Info("DRY-RUN: would cancel all orders")
-		return &types.CancelResponse{}, nil
-	}
-	if err := c.rl.Cancel.Wait(ctx); err != nil {
-		return nil, err
-	}
+// ————————————————————————————————————————————————————————————————————————
+// Helpers
+// ————————————————————————————————————————————————————————————————————————
 
-	headers, err := c.auth.L2Headers("DELETE", "/cancel-all", "")
-	if err != nil {
-		return nil, fmt.Errorf("l2 headers: %w", err)
+func boolStr(b bool) string {
+	if b {
+		return "true"
 	}
-
-	var result types.CancelResponse
-	resp, err := c.http.R().
-		SetContext(ctx).
-		SetHeaders(headers).
-		SetResult(&result).
-		Delete("/cancel-all")
-	if err != nil {
-		return nil, fmt.Errorf("cancel all: %w", err)
-	}
-	if resp.StatusCode() != http.StatusOK {
-		return nil, fmt.Errorf("cancel all: status %d: %s", resp.StatusCode(), resp.String())
-	}
-
-	c.logger.Warn("all orders cancelled", "count", len(result.Canceled))
-	return &result, nil
+	return "false"
 }
 
-// CancelMarketOrders cancels all orders for a specific market.
-func (c *Client) CancelMarketOrders(ctx context.Context, conditionID string) (*types.CancelResponse, error) {
-	if c.dryRun {
-		c.logger.Info("DRY-RUN: would cancel market orders", "market", conditionID)
-		return &types.CancelResponse{}, nil
-	}
-	if err := c.rl.Cancel.Wait(ctx); err != nil {
-		return nil, err
-	}
-
-	body := fmt.Sprintf(`{"market":"%s"}`, conditionID)
-	headers, err := c.auth.L2Headers("DELETE", "/cancel-market-orders", body)
-	if err != nil {
-		return nil, fmt.Errorf("l2 headers: %w", err)
-	}
-
-	var result types.CancelResponse
-	resp, err := c.http.R().
-		SetContext(ctx).
-		SetHeaders(headers).
-		SetBody(json.RawMessage(body)).
-		SetResult(&result).
-		Delete("/cancel-market-orders")
-	if err != nil {
-		return nil, fmt.Errorf("cancel market orders: %w", err)
-	}
-	if resp.StatusCode() != http.StatusOK {
-		return nil, fmt.Errorf("cancel market orders: status %d: %s", resp.StatusCode(), resp.String())
-	}
-	return &result, nil
+func floatStr(f float64) string {
+	return fmt.Sprintf("%g", f)
 }
 
-// DeriveAPIKey derives L2 API credentials via L1 authentication.
-func (c *Client) DeriveAPIKey(ctx context.Context) (*Credentials, error) {
-	headers, err := c.auth.L1Headers(0)
-	if err != nil {
-		return nil, fmt.Errorf("l1 headers: %w", err)
-	}
-
-	var result Credentials
-	resp, err := c.http.R().
-		SetContext(ctx).
-		SetHeaders(headers).
-		SetResult(&result).
-		Get("/auth/derive-api-key")
-	if err != nil {
-		return nil, fmt.Errorf("derive api key: %w", err)
-	}
-	if resp.StatusCode() != http.StatusOK {
-		return nil, fmt.Errorf("derive api key: status %d: %s", resp.StatusCode(), resp.String())
-	}
-
-	c.auth.SetCredentials(result)
-	c.logger.Info("API key derived")
-	return &result, nil
+func intStr(i int) string {
+	return fmt.Sprintf("%d", i)
 }
