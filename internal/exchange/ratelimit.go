@@ -1,13 +1,18 @@
-// ratelimit.go implements token-bucket rate limiting for the Polymarket CLOB API.
+// ratelimit.go implements token-bucket rate limiting for the Polymarket US API.
 //
-// Polymarket enforces per-category rate limits measured in requests per 10-second
-// windows. This file provides a smooth token-bucket implementation that refills
-// continuously (rather than in 10s bursts) to avoid hitting hard limits.
+// Polymarket US enforces per-category rate limits measured in requests per
+// 10-second windows. This file provides a smooth token-bucket implementation
+// that refills continuously (rather than in 10s bursts) to avoid hard limits.
 //
-// Three buckets are maintained:
-//   - Order:  350 burst / 50 per sec (maps to Polymarket's 3500/10s limit)
-//   - Cancel: 300 burst / 30 per sec (maps to 3000/10s limit)
-//   - Book:   150 burst / 15 per sec (maps to 1500/10s limit)
+// Published limits (per 10 seconds, per IP):
+//   - Global:  2,000 requests across all endpoints
+//   - Order:    400 (POST /v1/orders, DELETE /v1/order/{id}/cancel)
+//   - Book:      50 (GET /v1/orders/open)  — most conservative read endpoint
+//
+// We expose three buckets that cover the common trading operations:
+//   - Global: 200 burst / 200 per sec (maps to 2000/10s global limit)
+//   - Order:   40 burst /  40 per sec (maps to 400/10s order limit)
+//   - Book:     5 burst /   5 per sec (maps to 50/10s read limit)
 package exchange
 
 import (
@@ -67,22 +72,21 @@ func (tb *TokenBucket) Wait(ctx context.Context) error {
 	}
 }
 
-// RateLimiter groups token buckets by Polymarket API endpoint category.
-// Each trading operation must call the appropriate bucket's Wait() before
-// making the HTTP request.
+// RateLimiter groups token buckets by Polymarket US API endpoint category.
+// Each operation must call the appropriate bucket's Wait() before the HTTP request.
 type RateLimiter struct {
-	Order  *TokenBucket // POST /orders — placing new orders
-	Cancel *TokenBucket // DELETE /orders, /cancel-all, /cancel-market-orders
-	Book   *TokenBucket // GET /book — order book reads
+	Global *TokenBucket // global across all endpoints — 2000/10s
+	Order  *TokenBucket // POST /v1/orders, cancel — 400/10s
+	Book   *TokenBucket // GET reads (open orders, etc.) — 50/10s
 }
 
-// NewRateLimiter creates rate limiters tuned to Polymarket's published limits.
-// Capacities are set to the 10-second burst allowance, rates to 1/10th for
-// smooth refill.
+// NewRateLimiter creates rate limiters tuned to the Polymarket US published limits.
+// Capacities equal the 10-second burst allowance; rates are set to 1/10th for
+// smooth continuous refill.
 func NewRateLimiter() *RateLimiter {
 	return &RateLimiter{
-		Order:  NewTokenBucket(350, 50),  // 3500 per 10s window
-		Cancel: NewTokenBucket(300, 30),  // 3000 per 10s window
-		Book:   NewTokenBucket(150, 15),  // 1500 per 10s window
+		Global: NewTokenBucket(200, 200), // 2000 per 10s global
+		Order:  NewTokenBucket(40, 40),   // 400 per 10s order/cancel
+		Book:   NewTokenBucket(5, 5),     // 50 per 10s reads
 	}
 }
