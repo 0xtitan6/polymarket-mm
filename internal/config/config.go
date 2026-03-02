@@ -15,7 +15,7 @@ import (
 // Config is the top-level configuration. Maps directly to the YAML file structure.
 type Config struct {
 	DryRun    bool            `mapstructure:"dry_run"`
-	Wallet    WalletConfig    `mapstructure:"wallet"`
+	Auth      AuthConfig      `mapstructure:"auth"`
 	API       APIConfig       `mapstructure:"api"`
 	Strategy  StrategyConfig  `mapstructure:"strategy"`
 	Risk      RiskConfig      `mapstructure:"risk"`
@@ -25,26 +25,28 @@ type Config struct {
 	Dashboard DashboardConfig `mapstructure:"dashboard"`
 }
 
-// WalletConfig holds the Ethereum wallet used for signing orders.
-// PrivateKey signs L1 (EIP-712) auth and derives L2 API keys.
-// FunderAddress is the on-chain address that funds orders (may differ from signer if using a proxy).
-type WalletConfig struct {
-	PrivateKey    string `mapstructure:"private_key"`
-	SignatureType int    `mapstructure:"signature_type"`
-	FunderAddress string `mapstructure:"funder_address"`
-	ChainID       int    `mapstructure:"chain_id"`
+// AuthConfig holds the Ed25519 API credentials for the Polymarket US API.
+// APIKeyID is the UUID assigned when the API key is created.
+// PrivateKeyB64 is the base64-encoded Ed25519 private key (seed in first 32 bytes).
+type AuthConfig struct {
+	APIKeyID      string `mapstructure:"api_key_id"`      // Ed25519 API key UUID
+	PrivateKeyB64 string `mapstructure:"private_key_b64"` // base64-encoded Ed25519 private key
 }
 
-// APIConfig holds Polymarket API endpoints and optional pre-derived L2 credentials.
-// If ApiKey/Secret/Passphrase are empty, the bot derives them via L1 auth on startup.
+// APIConfig holds Polymarket US API endpoints.
 type APIConfig struct {
-	CLOBBaseURL  string `mapstructure:"clob_base_url"`
+	BaseURL      string `mapstructure:"base_url"`       // https://api.polymarket.us
+	WSMarketURL  string `mapstructure:"ws_market_url"`  // wss://api.polymarket.us/v1/ws/markets
+	WSPrivateURL string `mapstructure:"ws_private_url"` // wss://api.polymarket.us/v1/ws/private
+
+	// WSUserURL is a compatibility alias for WSPrivateURL, retained so
+	// existing engine code that reads cfg.API.WSUserURL continues to compile.
+	// Configure either field; WSUserURL takes precedence if both are set.
+	WSUserURL string `mapstructure:"ws_user_url"`
+
+	// GammaBaseURL is retained for the market scanner which may still poll
+	// the Polymarket Gamma metadata API for market discovery.
 	GammaBaseURL string `mapstructure:"gamma_base_url"`
-	WSMarketURL  string `mapstructure:"ws_market_url"`
-	WSUserURL    string `mapstructure:"ws_user_url"`
-	ApiKey       string `mapstructure:"api_key"`
-	Secret       string `mapstructure:"secret"`
-	Passphrase   string `mapstructure:"passphrase"`
 }
 
 // StrategyConfig tunes the Avellaneda-Stoikov market-making algorithm.
@@ -100,18 +102,17 @@ type RiskConfig struct {
 }
 
 // ScannerConfig controls how the bot discovers and filters tradeable markets.
-// The scanner polls the Gamma API and ranks markets by opportunity score:
+// The scanner polls the Markets API and ranks markets by opportunity score:
 // score = spread * sqrt(volume24h) * min(liquidity/10000, 1).
-// IncludeConditionIDs/IncludeSlugs/IncludeKeywords can constrain discovery to
-// a specific market set (useful for BTC-only strategies). ExcludeKeywords can
-// further remove noisy sub-families (for example 5m/15m contracts).
+// IncludeSlugs/IncludeKeywords can constrain discovery to a specific market set.
+// ExcludeKeywords can further remove noisy sub-families.
 type ScannerConfig struct {
 	PollInterval        time.Duration `mapstructure:"poll_interval"`
 	MinLiquidity        float64       `mapstructure:"min_liquidity"`
 	MinVolume24h        float64       `mapstructure:"min_volume_24h"`
 	MinSpread           float64       `mapstructure:"min_spread"`
 	MaxEndDateDays      int           `mapstructure:"max_end_date_days"`
-	IncludeConditionIDs []string      `mapstructure:"include_condition_ids"`
+	IncludeConditionIDs []string      `mapstructure:"include_condition_ids"` // retained for Gamma-based scanner
 	IncludeSlugs        []string      `mapstructure:"include_slugs"`
 	IncludeKeywords     []string      `mapstructure:"include_keywords"`
 	ExcludeKeywords     []string      `mapstructure:"exclude_keywords"`
@@ -136,7 +137,7 @@ type DashboardConfig struct {
 }
 
 // Load reads config from a YAML file with env var overrides.
-// Sensitive fields use env vars: POLY_PRIVATE_KEY, POLY_API_KEY, POLY_API_SECRET, POLY_PASSPHRASE.
+// Sensitive fields use env vars: POLY_API_KEY_ID, POLY_PRIVATE_KEY_B64.
 func Load(path string) (*Config, error) {
 	v := viper.New()
 	v.SetConfigFile(path)
@@ -153,18 +154,12 @@ func Load(path string) (*Config, error) {
 		return nil, fmt.Errorf("unmarshal config: %w", err)
 	}
 
-	// Override sensitive fields from env
-	if key := os.Getenv("POLY_PRIVATE_KEY"); key != "" {
-		cfg.Wallet.PrivateKey = key
+	// Override sensitive auth fields from env
+	if key := os.Getenv("POLY_API_KEY_ID"); key != "" {
+		cfg.Auth.APIKeyID = key
 	}
-	if key := os.Getenv("POLY_API_KEY"); key != "" {
-		cfg.API.ApiKey = key
-	}
-	if secret := os.Getenv("POLY_API_SECRET"); secret != "" {
-		cfg.API.Secret = secret
-	}
-	if pass := os.Getenv("POLY_PASSPHRASE"); pass != "" {
-		cfg.API.Passphrase = pass
+	if pk := os.Getenv("POLY_PRIVATE_KEY_B64"); pk != "" {
+		cfg.Auth.PrivateKeyB64 = pk
 	}
 	if os.Getenv("POLY_DRY_RUN") == "true" || os.Getenv("POLY_DRY_RUN") == "1" {
 		cfg.DryRun = true
@@ -175,22 +170,14 @@ func Load(path string) (*Config, error) {
 
 // Validate checks all required fields and value ranges.
 func (c *Config) Validate() error {
-	if c.Wallet.PrivateKey == "" {
-		return fmt.Errorf("wallet.private_key is required (set POLY_PRIVATE_KEY)")
+	if c.Auth.APIKeyID == "" {
+		return fmt.Errorf("auth.api_key_id is required (set POLY_API_KEY_ID)")
 	}
-	if c.Wallet.ChainID == 0 {
-		return fmt.Errorf("wallet.chain_id is required (137 for mainnet)")
+	if c.Auth.PrivateKeyB64 == "" {
+		return fmt.Errorf("auth.private_key_b64 is required (set POLY_PRIVATE_KEY_B64)")
 	}
-	switch c.Wallet.SignatureType {
-	case 0, 1, 2:
-	default:
-		return fmt.Errorf("wallet.signature_type must be one of: 0 (EOA), 1 (POLY_PROXY), 2 (GNOSIS_SAFE)")
-	}
-	if c.Wallet.SignatureType != 0 && c.Wallet.FunderAddress == "" {
-		return fmt.Errorf("wallet.funder_address is required when wallet.signature_type is 1 or 2")
-	}
-	if c.API.CLOBBaseURL == "" {
-		return fmt.Errorf("api.clob_base_url is required")
+	if c.API.BaseURL == "" {
+		return fmt.Errorf("api.base_url is required")
 	}
 	if c.Strategy.Gamma <= 0 {
 		return fmt.Errorf("strategy.gamma must be > 0")
