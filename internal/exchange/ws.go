@@ -1,16 +1,21 @@
-// ws.go implements WebSocket feeds for real-time Polymarket data.
+// ws.go implements WebSocket feeds for real-time Polymarket US data.
 //
 // Two independent feeds run concurrently:
 //
-//   - Market feed (public): subscribes by asset ID (token ID), receives
-//     "book" snapshots and "price_change" deltas for the order book.
+//   - Market feed (public):  wss://api.polymarket.us/v1/ws/markets
+//     Subscribes by market slug. Receives full book snapshots and incremental
+//     updates containing bids, offers, and stats.
 //
-//   - User feed (authenticated): subscribes by condition ID, receives
-//     "trade" fills and "order" lifecycle events (placement, cancellation).
+//   - Private feed (authenticated): wss://api.polymarket.us/v1/ws/private
+//     Subscribes globally. Receives order lifecycle events and fill notifications.
+//
+// Both feeds authenticate during the WebSocket HTTP upgrade handshake by
+// sending the same Ed25519 headers (X-PM-Access-Key, X-PM-Timestamp,
+// X-PM-Signature) as HTTP headers on the upgrade request.
 //
 // Both feeds auto-reconnect with exponential backoff (1s → 30s max) and
-// re-subscribe to all tracked IDs on reconnection. A read deadline (90s)
-// ensures silent server failures are detected within ~2 missed pings.
+// re-subscribe to all tracked slugs on reconnection. A read deadline (90s)
+// ensures silent server failures are detected within ~2 missed heartbeats.
 package exchange
 
 import (
@@ -18,6 +23,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
+	"net/http"
 	"sync"
 	"time"
 
@@ -27,77 +33,119 @@ import (
 )
 
 const (
-	pingInterval     = 50 * time.Second  // how often we send PING to keep alive
-	readTimeout      = 90 * time.Second  // ~2 missed pings triggers reconnect
-	maxReconnectWait = 30 * time.Second  // cap on exponential backoff
-	writeTimeout     = 10 * time.Second  // deadline for outgoing messages
-	readBufferSize   = 256               // buffer for book/price events
-	tradeBufferSize  = 64                // buffer for trade/order events
+	wsPingInterval     = 50 * time.Second // how often to send a ping to keep alive
+	wsReadTimeout      = 90 * time.Second // ~2 missed heartbeats triggers reconnect
+	wsMaxReconnectWait = 30 * time.Second // cap on exponential backoff
+	wsWriteTimeout     = 10 * time.Second // deadline for outgoing messages
+	wsBookBufferSize   = 256              // buffer depth for book update events
+	wsPrivateBufferSize = 64             // buffer depth for private order/fill events
 )
 
-// WSFeed manages a single WebSocket connection (market or user channel).
+// WSFeed manages a single WebSocket connection (market or private channel).
 // It handles connection lifecycle, subscription tracking, message routing,
 // and automatic reconnection with exponential backoff.
 type WSFeed struct {
 	url         string
 	conn        *websocket.Conn
-	connMu      sync.Mutex   // protects conn reads/writes
-	auth        *Auth        // nil for market channel, set for user channel
-	channelType string       // "market" or "user"
+	connMu      sync.Mutex  // protects conn reads/writes
+	auth        *Auth       // used to sign the upgrade handshake
+	feedType    string      // "market" or "private"
 
-	// Track subscriptions for automatic re-subscribe on reconnect
+	// Slug subscriptions — tracked for automatic re-subscribe on reconnect.
 	subscribedMu sync.RWMutex
-	subscribed   map[string]bool // asset IDs (market) or condition IDs (user)
+	subscribed   map[string]bool // market slugs
 
-	// Typed event channels — consumers read from these via accessor methods
-	bookCh        chan types.WSBookEvent        // full book snapshots
-	priceChangeCh chan types.WSPriceChangeEvent // incremental book updates
-	tradeCh       chan types.WSTradeEvent       // fill notifications
-	orderCh       chan types.WSOrderEvent       // order lifecycle events
+	// Typed event channels — consumers read from these via accessor methods.
+	bookCh    chan types.USWSBookEvent    // market feed: book snapshots / updates
+	orderCh   chan types.USWSPrivateEvent // private feed: order / fill events
+
+	// Legacy-typed channels for backward compatibility with the engine layer.
+	// These mirror the new channels but use the old WSBookEvent / WSOrderEvent types,
+	// translated from the US API response format.
+	legacyBookCh  chan types.WSBookEvent  // translated from USWSBookEvent
+	legacyOrderCh chan types.WSOrderEvent // translated from USWSPrivateEvent
 
 	logger *slog.Logger
 }
 
-// NewMarketFeed creates a WebSocket feed for the market channel (public).
-func NewMarketFeed(wsURL string, logger *slog.Logger) *WSFeed {
+// NewMarketFeed creates a WebSocket feed for the market channel (public book updates).
+// The auth parameter may be nil if the market feed doesn't require authentication,
+// or omitted entirely for backward compatibility.
+func NewMarketFeed(wsURL string, authAndLogger ...interface{}) *WSFeed {
+	var auth *Auth
+	var logger *slog.Logger
+
+	for _, arg := range authAndLogger {
+		switch v := arg.(type) {
+		case *Auth:
+			auth = v
+		case *slog.Logger:
+			logger = v
+		}
+	}
+	if logger == nil {
+		logger = slog.Default()
+	}
+
 	return &WSFeed{
 		url:           wsURL,
-		channelType:   "market",
+		auth:          auth,
+		feedType:      "market",
 		subscribed:    make(map[string]bool),
-		bookCh:        make(chan types.WSBookEvent, readBufferSize),
-		priceChangeCh: make(chan types.WSPriceChangeEvent, readBufferSize),
-		tradeCh:       make(chan types.WSTradeEvent, tradeBufferSize),
-		orderCh:       make(chan types.WSOrderEvent, tradeBufferSize),
+		bookCh:        make(chan types.USWSBookEvent, wsBookBufferSize),
+		orderCh:       make(chan types.USWSPrivateEvent, wsPrivateBufferSize),
+		legacyBookCh:  make(chan types.WSBookEvent, wsBookBufferSize),
+		legacyOrderCh: make(chan types.WSOrderEvent, wsPrivateBufferSize),
 		logger:        logger.With("component", "ws_market"),
 	}
 }
 
-// NewUserFeed creates a WebSocket feed for the user channel (authenticated).
-func NewUserFeed(wsURL string, auth *Auth, logger *slog.Logger) *WSFeed {
+// NewPrivateFeed creates a WebSocket feed for the private channel (fills / order lifecycle).
+func NewPrivateFeed(wsURL string, auth *Auth, logger *slog.Logger) *WSFeed {
 	return &WSFeed{
 		url:           wsURL,
 		auth:          auth,
-		channelType:   "user",
+		feedType:      "private",
 		subscribed:    make(map[string]bool),
-		bookCh:        make(chan types.WSBookEvent, readBufferSize),
-		priceChangeCh: make(chan types.WSPriceChangeEvent, readBufferSize),
-		tradeCh:       make(chan types.WSTradeEvent, tradeBufferSize),
-		orderCh:       make(chan types.WSOrderEvent, tradeBufferSize),
-		logger:        logger.With("component", "ws_user"),
+		bookCh:        make(chan types.USWSBookEvent, wsBookBufferSize),
+		orderCh:       make(chan types.USWSPrivateEvent, wsPrivateBufferSize),
+		legacyBookCh:  make(chan types.WSBookEvent, wsBookBufferSize),
+		legacyOrderCh: make(chan types.WSOrderEvent, wsPrivateBufferSize),
+		logger:        logger.With("component", "ws_private"),
 	}
 }
 
-// BookEvents returns a read-only channel of book snapshot events.
-func (f *WSFeed) BookEvents() <-chan types.WSBookEvent { return f.bookCh }
+// NewUserFeed is a compatibility alias for NewPrivateFeed.
+// The engine uses exchange.NewUserFeed; this alias makes it compile unchanged.
+func NewUserFeed(wsURL string, auth *Auth, logger *slog.Logger) *WSFeed {
+	return NewPrivateFeed(wsURL, auth, logger)
+}
 
-// PriceChangeEvents returns a read-only channel of price change events.
-func (f *WSFeed) PriceChangeEvents() <-chan types.WSPriceChangeEvent { return f.priceChangeCh }
+// USBookEvents returns the US API-typed book update channel.
+func (f *WSFeed) USBookEvents() <-chan types.USWSBookEvent { return f.bookCh }
 
-// TradeEvents returns a read-only channel of trade events (user channel).
-func (f *WSFeed) TradeEvents() <-chan types.WSTradeEvent { return f.tradeCh }
+// USOrderEvents returns the US API-typed private order/fill event channel.
+func (f *WSFeed) USOrderEvents() <-chan types.USWSPrivateEvent { return f.orderCh }
 
-// OrderEvents returns a read-only channel of order events (user channel).
-func (f *WSFeed) OrderEvents() <-chan types.WSOrderEvent { return f.orderCh }
+// BookEvents returns the legacy-typed book snapshot channel for backward
+// compatibility with the engine layer. Events are translated from USWSBookEvent.
+func (f *WSFeed) BookEvents() <-chan types.WSBookEvent { return f.legacyBookCh }
+
+// OrderEvents returns the legacy-typed order lifecycle channel for backward
+// compatibility with the engine layer. Events are translated from USWSPrivateEvent.
+func (f *WSFeed) OrderEvents() <-chan types.WSOrderEvent { return f.legacyOrderCh }
+
+// PriceChangeEvents returns a compatibility channel for the legacy WSPriceChangeEvent type.
+// The US API does not emit separate incremental price-change events; all book updates
+// arrive as full snapshots on BookEvents(). This method returns a nil channel so
+// existing engine code that selects on it compiles and runs safely (a nil channel
+// blocks forever, which is the desired behavior — just no price-change events).
+func (f *WSFeed) PriceChangeEvents() <-chan types.WSPriceChangeEvent { return nil }
+
+// TradeEvents returns a compatibility channel for the legacy WSTradeEvent type.
+// The US API private feed delivers fills within USWSPrivateEvent on OrderEvents().
+// This method returns a nil channel for engine compatibility.
+func (f *WSFeed) TradeEvents() <-chan types.WSTradeEvent { return nil }
 
 // Run connects and maintains the WebSocket connection with auto-reconnect.
 // Blocks until ctx is cancelled.
@@ -121,51 +169,43 @@ func (f *WSFeed) Run(ctx context.Context) error {
 		case <-time.After(backoff):
 		}
 
-		// Exponential backoff: 1s, 2s, 4s, 8s, ..., 30s max
+		// Exponential backoff: 1s, 2s, 4s, …, 30s max
 		backoff *= 2
-		if backoff > maxReconnectWait {
-			backoff = maxReconnectWait
+		if backoff > wsMaxReconnectWait {
+			backoff = wsMaxReconnectWait
 		}
 	}
 }
 
-// Subscribe adds asset IDs (market channel) or condition IDs (user channel).
-func (f *WSFeed) Subscribe(ctx context.Context, ids []string) error {
+// Subscribe adds market slugs to the subscription set and sends a subscribe
+// message if the connection is live.
+func (f *WSFeed) Subscribe(ctx context.Context, slugs []string) error {
 	f.subscribedMu.Lock()
-	for _, id := range ids {
-		f.subscribed[id] = true
+	for _, s := range slugs {
+		f.subscribed[s] = true
 	}
 	f.subscribedMu.Unlock()
 
-	msg := types.WSUpdateMsg{
-		Operation: "subscribe",
-	}
-	if f.channelType == "market" {
-		msg.AssetIDs = ids
-	} else {
-		msg.Markets = ids
-	}
-
-	return f.writeJSON(msg)
+	return f.sendSubscribeMsg(slugs)
 }
 
-// Unsubscribe removes IDs from the subscription.
-func (f *WSFeed) Unsubscribe(ctx context.Context, ids []string) error {
+// Unsubscribe removes market slugs and sends an unsubscribe message.
+func (f *WSFeed) Unsubscribe(ctx context.Context, slugs []string) error {
 	f.subscribedMu.Lock()
-	for _, id := range ids {
-		delete(f.subscribed, id)
+	for _, s := range slugs {
+		delete(f.subscribed, s)
 	}
 	f.subscribedMu.Unlock()
 
-	msg := types.WSUpdateMsg{
-		Operation: "unsubscribe",
+	msg := types.USWSDynamicSubscribe{
+		Action: "unsubscribe",
+		Params: types.USWSDynamicParams{
+			MarketSlugs: slugs,
+			SubscriptionTypes: []types.USWSSubscriptionType{
+				types.SubscriptionTypeMarketData,
+			},
+		},
 	}
-	if f.channelType == "market" {
-		msg.AssetIDs = ids
-	} else {
-		msg.Markets = ids
-	}
-
 	return f.writeJSON(msg)
 }
 
@@ -179,8 +219,22 @@ func (f *WSFeed) Close() error {
 	return nil
 }
 
+// connectAndRead dials the server, sends the initial subscription, and reads
+// messages until the connection drops or ctx is cancelled.
 func (f *WSFeed) connectAndRead(ctx context.Context) error {
-	conn, _, err := websocket.DefaultDialer.DialContext(ctx, f.url, nil)
+	// Build auth headers for the upgrade handshake.
+	// The path used for signing is the WS path (after the host).
+	wsPath := wsPathFrom(f.url)
+	authHeaders := f.auth.SignRequest("GET", wsPath)
+	upgradeHeaders := http.Header{}
+	for k, v := range authHeaders {
+		upgradeHeaders.Set(k, v)
+	}
+
+	dialer := &websocket.Dialer{
+		HandshakeTimeout: 15 * time.Second, // don't hang forever on dial
+	}
+	conn, _, err := dialer.DialContext(ctx, f.url, upgradeHeaders)
 	if err != nil {
 		return fmt.Errorf("dial: %w", err)
 	}
@@ -196,25 +250,20 @@ func (f *WSFeed) connectAndRead(ctx context.Context) error {
 		f.connMu.Unlock()
 	}()
 
-	// Send initial subscription
+	// Send initial subscription message.
 	if err := f.sendInitialSubscription(); err != nil {
-		return fmt.Errorf("subscribe: %w", err)
+		return fmt.Errorf("initial subscribe: %w", err)
 	}
 
-	f.logger.Info("websocket connected", "channel", f.channelType)
+	f.logger.Info("websocket connected", "feed", f.feedType)
 
-	// Start ping goroutine
-	pingCtx, pingCancel := context.WithCancel(ctx)
-	defer pingCancel()
-	go f.pingLoop(pingCtx)
-
-	// Read loop with deadline so we reconnect if server goes silent
+	// Read loop with deadline so we reconnect if the server goes silent.
 	for {
 		if ctx.Err() != nil {
 			return ctx.Err()
 		}
 
-		conn.SetReadDeadline(time.Now().Add(readTimeout))
+		conn.SetReadDeadline(time.Now().Add(wsReadTimeout))
 		_, msg, err := conn.ReadMessage()
 		if err != nil {
 			return fmt.Errorf("read: %w", err)
@@ -224,113 +273,112 @@ func (f *WSFeed) connectAndRead(ctx context.Context) error {
 	}
 }
 
+// sendInitialSubscription sends the subscription message appropriate for
+// the feed type after a (re)connection is established.
 func (f *WSFeed) sendInitialSubscription() error {
 	f.subscribedMu.RLock()
-	ids := make([]string, 0, len(f.subscribed))
-	for id := range f.subscribed {
-		ids = append(ids, id)
+	slugs := make([]string, 0, len(f.subscribed))
+	for s := range f.subscribed {
+		slugs = append(slugs, s)
 	}
 	f.subscribedMu.RUnlock()
 
-	if f.channelType == "market" {
-		msg := types.WSSubscribeMsg{
-			Type:     "market",
-			AssetIDs: ids,
-		}
-		return f.writeJSON(msg)
+	if f.feedType == "market" {
+		return f.writeJSON(types.USWSSubscribeRequest{
+			Request: types.USWSSubscribeBody{
+				Type:        types.SubscriptionTypeMarketData,
+				MarketSlugs: slugs,
+			},
+		})
 	}
 
-	// User channel requires auth
-	msg := types.WSSubscribeMsg{
-		Type:    "user",
-		Auth:    f.auth.WSAuthPayload(),
-		Markets: ids,
+	// Private feed subscribes globally (no specific slugs required).
+	return f.writeJSON(types.USWSSubscribeRequest{
+		Request: types.USWSSubscribeBody{
+			Type:        types.SubscriptionTypeOrder,
+			MarketSlugs: []string{},
+		},
+	})
+}
+
+// sendSubscribeMsg sends a dynamic subscribe message for new slugs (market feed).
+func (f *WSFeed) sendSubscribeMsg(slugs []string) error {
+	if f.feedType == "private" {
+		// Private feed doesn't filter by slug.
+		return nil
+	}
+
+	msg := types.USWSDynamicSubscribe{
+		Action: "subscribe",
+		Params: types.USWSDynamicParams{
+			MarketSlugs: slugs,
+			SubscriptionTypes: []types.USWSSubscriptionType{
+				types.SubscriptionTypeMarketData,
+			},
+		},
 	}
 	return f.writeJSON(msg)
 }
 
+// dispatchMessage routes an incoming raw message to the appropriate typed channels.
+// It populates both the US-typed channels and the legacy-translated channels.
 func (f *WSFeed) dispatchMessage(data []byte) {
-	// Peek at event_type to route
-	var envelope struct {
-		EventType string `json:"event_type"`
-	}
-	if err := json.Unmarshal(data, &envelope); err != nil {
-		f.logger.Debug("ignoring non-json ws message", "data", string(data))
+	// First check for a heartbeat — cheapest case.
+	var hb types.USWSHeartbeat
+	if err := json.Unmarshal(data, &hb); err == nil && hb.Heartbeat != nil {
+		f.logger.Debug("heartbeat received")
 		return
 	}
 
-	switch envelope.EventType {
-	case "book":
-		var evt types.WSBookEvent
+	if f.feedType == "market" {
+		var evt types.USWSBookEvent
 		if err := json.Unmarshal(data, &evt); err != nil {
-			f.logger.Error("unmarshal book event", "error", err)
+			f.logger.Debug("ignoring non-book market message", "data", truncate(string(data), 120))
 			return
 		}
+		if evt.Payload.MarketSlug == "" {
+			// Probably a control/info message; drop silently.
+			return
+		}
+		// Send to US-typed channel.
 		select {
 		case f.bookCh <- evt:
 		default:
-			f.logger.Warn("book channel full, dropping event", "asset", evt.AssetID)
+			f.logger.Warn("book channel full, dropping event",
+				"market", evt.Payload.MarketSlug)
 		}
-
-	case "price_change":
-		var evt types.WSPriceChangeEvent
-		if err := json.Unmarshal(data, &evt); err != nil {
-			f.logger.Error("unmarshal price_change event", "error", err)
-			return
-		}
+		// Send translated event to legacy channel.
+		legacy := usWSBookToLegacy(evt)
 		select {
-		case f.priceChangeCh <- evt:
+		case f.legacyBookCh <- legacy:
 		default:
-			f.logger.Warn("price_change channel full, dropping event")
+			f.logger.Warn("legacy book channel full, dropping event",
+				"market", evt.Payload.MarketSlug)
 		}
-
-	case "trade":
-		var evt types.WSTradeEvent
-		if err := json.Unmarshal(data, &evt); err != nil {
-			f.logger.Error("unmarshal trade event", "error", err)
-			return
-		}
-		select {
-		case f.tradeCh <- evt:
-		default:
-			f.logger.Warn("trade channel full, dropping event", "id", evt.ID)
-		}
-
-	case "order":
-		var evt types.WSOrderEvent
-		if err := json.Unmarshal(data, &evt); err != nil {
-			f.logger.Error("unmarshal order event", "error", err)
-			return
-		}
-		select {
-		case f.orderCh <- evt:
-		default:
-			f.logger.Warn("order channel full, dropping event", "id", evt.ID)
-		}
-
-	case "last_trade_price", "tick_size_change", "best_bid_ask", "new_market", "market_resolved":
-		// Informational events we don't need to process
-		f.logger.Debug("ignoring event", "type", envelope.EventType)
-
-	default:
-		f.logger.Debug("unknown ws event type", "type", envelope.EventType)
+		return
 	}
-}
 
-func (f *WSFeed) pingLoop(ctx context.Context) {
-	ticker := time.NewTicker(pingInterval)
-	defer ticker.Stop()
-
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-ticker.C:
-			if err := f.writeMessage(websocket.TextMessage, []byte("PING")); err != nil {
-				f.logger.Warn("ping failed", "error", err)
-				return
-			}
-		}
+	// Private feed
+	var evt types.USWSPrivateEvent
+	if err := json.Unmarshal(data, &evt); err != nil {
+		f.logger.Debug("ignoring non-order private message", "data", truncate(string(data), 120))
+		return
+	}
+	if evt.Order.ID == "" {
+		return
+	}
+	// Send to US-typed channel.
+	select {
+	case f.orderCh <- evt:
+	default:
+		f.logger.Warn("order channel full, dropping event", "id", evt.Order.ID)
+	}
+	// Send translated event to legacy channel.
+	legacy := usWSOrderToLegacy(evt)
+	select {
+	case f.legacyOrderCh <- legacy:
+	default:
+		f.logger.Warn("legacy order channel full, dropping event", "id", evt.Order.ID)
 	}
 }
 
@@ -340,16 +388,74 @@ func (f *WSFeed) writeJSON(v interface{}) error {
 	if f.conn == nil {
 		return fmt.Errorf("websocket not connected")
 	}
-	f.conn.SetWriteDeadline(time.Now().Add(writeTimeout))
+	f.conn.SetWriteDeadline(time.Now().Add(wsWriteTimeout))
 	return f.conn.WriteJSON(v)
 }
 
-func (f *WSFeed) writeMessage(msgType int, data []byte) error {
-	f.connMu.Lock()
-	defer f.connMu.Unlock()
-	if f.conn == nil {
-		return fmt.Errorf("websocket not connected")
+// wsPathFrom extracts the path component from a wss:// URL for signing purposes.
+// e.g. "wss://api.polymarket.us/v1/ws/markets" → "/v1/ws/markets"
+func wsPathFrom(rawURL string) string {
+	// Find third slash (after scheme and host)
+	// "wss://api.polymarket.us/v1/ws/markets"
+	//           ^               ^
+	//  skip "wss://"           start here
+	const schemeLen = len("wss://")
+	if len(rawURL) <= schemeLen {
+		return "/"
 	}
-	f.conn.SetWriteDeadline(time.Now().Add(writeTimeout))
-	return f.conn.WriteMessage(msgType, data)
+	rest := rawURL[schemeLen:]
+	idx := 0
+	for idx < len(rest) && rest[idx] != '/' {
+		idx++
+	}
+	if idx >= len(rest) {
+		return "/"
+	}
+	return rest[idx:]
+}
+
+// truncate limits a string to n bytes for logging purposes.
+func truncate(s string, n int) string {
+	if len(s) <= n {
+		return s
+	}
+	return s[:n] + "…"
+}
+
+// usWSBookToLegacy translates a US API book event to the legacy WSBookEvent format.
+func usWSBookToLegacy(evt types.USWSBookEvent) types.WSBookEvent {
+	p := evt.Payload
+	buys := make([]types.PriceLevel, len(p.Bids))
+	for i, b := range p.Bids {
+		buys[i] = types.PriceLevel{Price: b.Px.Value, Size: b.Qty}
+	}
+	sells := make([]types.PriceLevel, len(p.Offers))
+	for i, a := range p.Offers {
+		sells[i] = types.PriceLevel{Price: a.Px.Value, Size: a.Qty}
+	}
+	return types.WSBookEvent{
+		EventType: "book",
+		AssetID:   p.MarketSlug,
+		Market:    p.MarketSlug,
+		Timestamp: p.TransactTime,
+		Buys:      buys,
+		Sells:     sells,
+	}
+}
+
+// usWSOrderToLegacy translates a US API private event to the legacy WSOrderEvent format.
+func usWSOrderToLegacy(evt types.USWSPrivateEvent) types.WSOrderEvent {
+	ord := evt.Order
+	return types.WSOrderEvent{
+		EventType:    "order",
+		ID:           ord.ID,
+		Market:       ord.MarketSlug,
+		AssetID:      ord.MarketSlug,
+		Side:         ord.Side,
+		Price:        ord.Price.Value,
+		OriginalSize: ord.Quantity,
+		SizeMatched:  ord.CumQuantity,
+		Timestamp:    evt.Execution.TransactTime,
+		Type:         string(evt.Execution.Type),
+	}
 }

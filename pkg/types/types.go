@@ -176,10 +176,11 @@ type OrderPayload struct {
 
 // OrderResponse is the REST API response for each order in a batch POST.
 type OrderResponse struct {
-	Success  bool   `json:"success"`
-	ErrorMsg string `json:"errorMsg"`
-	OrderID  string `json:"orderID"`
-	Status   string `json:"status"` // e.g. "live", "matched"
+	Success    bool           `json:"success"`
+	ErrorMsg   string         `json:"errorMsg"`
+	OrderID    string         `json:"orderID"`
+	Status     string         `json:"status"` // e.g. "live", "matched"
+	Executions []USExecution  `json:"-"`       // instant fills returned by PlaceOrder
 }
 
 // OpenOrder represents a live resting order on the CLOB.
