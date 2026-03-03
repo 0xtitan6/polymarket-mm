@@ -232,21 +232,12 @@ func TestBug2_DuplicateFillDoubleCount(t *testing.T) {
 		t.Fatalf("first fill: YesQty = %v, want 5", pos.YesQty)
 	}
 
-	// Duplicate event (same cumQty=5).
-	// delta = 5 - 5 = 0, fillSize <= 0 → FALLBACK uses cumQty=5 → adds 5 more.
-	// This is a KNOWN BUG that should be fixed. When fixed, change expected to 5.
+	// FIXED: delta = 5 - 5 = 0, fillSize <= 0 → return (no double-count)
 	m.handleOrderEvent(event)
 	pos = m.inventory.Snapshot()
 
-	// CURRENT BEHAVIOR (buggy): 10 due to fallback
-	// DESIRED BEHAVIOR (fixed): 5 (duplicate should be no-op)
-	if pos.YesQty == 10 {
-		t.Log("KNOWN BUG: duplicate fill with same cumQty double-counted. " +
-			"When fixed, this test should expect YesQty=5.")
-	} else if pos.YesQty == 5 {
-		t.Log("BUG FIXED: duplicate fill correctly ignored")
-	} else {
-		t.Errorf("unexpected YesQty = %v after duplicate fill", pos.YesQty)
+	if pos.YesQty != 5 {
+		t.Errorf("BUG REGRESSION: duplicate fill double-counted. YesQty = %v, want 5", pos.YesQty)
 	}
 }
 
@@ -1043,15 +1034,9 @@ func TestInteraction_InstantFillThenWSFill_NoDoubleCount(t *testing.T) {
 	})
 
 	pos = m.inventory.Snapshot()
-	// If SizeMatched is properly tracked, delta = 10 - 10 = 0.
-	// But the fallback logic (fillSize <= 0 → use cumQty) would add 10 more.
-	// This is the Bug #2 interaction — document the actual behavior.
-	if pos.YesQty == 20 {
-		t.Log("KNOWN ISSUE: instant fill + WS fill double-counted due to fallback logic. " +
-			"Fix the fillSize <= 0 fallback to actually return instead of using cumQty.")
-	} else if pos.YesQty == 10 {
-		t.Log("CORRECT: WS fill correctly deduplicated against instant fill")
-	} else {
-		t.Errorf("unexpected YesQty = %v after instant+WS fill", pos.YesQty)
+	// With the Bug #2 fix, delta = 10 - 10 = 0, fillSize <= 0 → return.
+	// No double-counting.
+	if pos.YesQty != 10 {
+		t.Errorf("BUG REGRESSION: instant fill + WS fill double-counted. YesQty = %v, want 10", pos.YesQty)
 	}
 }
