@@ -111,6 +111,24 @@ func (b *Book) BestBidAsk() (bid, ask float64, ok bool) {
 	return parsePrice(b.yes.Bids[0].Price), parsePrice(b.yes.Asks[0].Price), true
 }
 
+// BestBidAskWithDepth returns the best bid/ask prices and their depth (size) at the top of book.
+// This is used by the maker to decide whether to match BBO (aggressive quoting)
+// or quote behind (defensive).
+func (b *Book) BestBidAskWithDepth() (bid, ask float64, bidDepth, askDepth float64, ok bool) {
+	b.mu.RLock()
+	defer b.mu.RUnlock()
+
+	if len(b.yes.Bids) == 0 || len(b.yes.Asks) == 0 {
+		return 0, 0, 0, 0, false
+	}
+
+	bid = parsePrice(b.yes.Bids[0].Price)
+	ask = parsePrice(b.yes.Asks[0].Price)
+	bidDepth = parsePrice(b.yes.Bids[0].Size)
+	askDepth = parsePrice(b.yes.Asks[0].Size)
+	return bid, ask, bidDepth, askDepth, true
+}
+
 // IsStale returns true if the book hasn't been updated within maxAge.
 func (b *Book) IsStale(maxAge time.Duration) bool {
 	b.mu.RLock()

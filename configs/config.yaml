@@ -1,4 +1,4 @@
-dry_run: true  # set to false for live trading
+dry_run: true  # Safety default for repo — set to false for live trading
 
 auth:
   api_key_id: ""          # set via POLY_API_KEY_ID env (UUID from polymarket.us/developer)
@@ -10,40 +10,57 @@ api:
   ws_private_url: "wss://api.polymarket.us/v1/ws/private"
 
 strategy:
-  gamma: 0.20               # higher risk aversion for game-day markets (fast moves)
-  sigma: 0.6                # higher vol — game-day prices swing on live scores
-  k: 1.5                    # higher order arrival — game markets are more active
+  gamma: 0.40               # INCREASED from 0.20 — stronger inventory skew, tighter spread control
+  sigma: 0.6                # base volatility — game-day prices swing on live scores
+  k: 1.5                    # order arrival intensity — game markets are active
   t: 0.00137                # shorter horizon (~0.5 day) — games resolve today
-  default_spread_bps: 100   # 1% minimum spread — need to be AT the BBO to get filled
-  order_size_usd: 3.0       # $3 per side — spread across more markets
-  refresh_interval: 10s     # faster refresh for game-day markets
+  default_spread_bps: 300   # INCREASED from 100 — must clear 2% winner fee (need 250bps+ to profit)
+  order_size_usd: 1.0       # REDUCED from 3.0 — Kelly sizing overrides this, but cap per-side to $1
+  refresh_interval: 1s      # Fallback timer — event-driven requoting handles real-time updates
   stale_book_timeout: 90s   # shorter timeout — game markets should be active
+
+  # Half-Kelly position sizing
+  kelly_fraction: 0.5       # half-Kelly — conservative, proven optimal for noisy edge estimates
+  min_edge_bps: 50          # skip quotes with less than 50bps edge (noise filter)
+  winner_fee_pct: 0.02      # Polymarket 2% winner fee — deducted from edge calculation
+
+  # Volatility-aware spread
+  vol_lookback_fills: 30    # use last 30 mid-price samples to estimate realized vol
+  vol_spread_floor: 1.0     # minimum vol multiplier (no reduction below base spread)
+  vol_spread_ceiling: 3.0   # max 3x spread widening during high realized vol
+
+  # BBO matching (NEW v4)
+  bbo_match_max_depth: 200  # match BBO when top-of-book depth < 200 tokens (queue priority)
 
   # Toxic flow detection
   flow_window: 60s                    # Tighter window — game-day flow moves fast
   flow_toxicity_threshold: 0.5        # Lower threshold — be cautious on game day
   flow_cooldown_period: 120s          # 2 min — game-day markets recover faster
-  flow_max_spread_multiplier: 2.5     # Max 2.5x spread widening
+  flow_max_spread_multiplier: 2.5     # Max 2.5x spread widening from toxic flow
 
 risk:
-  max_position_per_market: 3.0    # $3 max per market — spread risk across more games
-  max_global_exposure: 10.0       # $10 total
-  max_markets_active: 5           # 5 game markets active simultaneously
-  kill_switch_drop_pct: 0.30      # 30% price move triggers kill (game results swing hard)
+  max_position_per_market: 1.0    # REDUCED from 3.0 — only $2 in account
+  max_global_exposure: 2.00       # Match actual balance (~$2)
+  max_markets_active: 3           # Focus capital on fewer markets
+  kill_switch_drop_pct: 0.30      # 30% price move triggers kill
   kill_switch_window_sec: 60
-  max_daily_loss: 3.0             # $3 daily loss limit (30% of capital)
-  cooldown_after_kill: 5m
+  max_daily_loss: 0.50            # Can only afford to lose $0.50
+  cooldown_after_kill: 10m        # Don't re-enter volatile markets too fast
 
 scanner:
-  poll_interval: 60s              # scan every 1 min — game markets are dynamic
+  poll_interval: 180s             # INCREASED from 60s — stick with markets longer (hysteresis)
   min_liquidity: 0                # US API doesn't provide inline liquidity data
   min_volume_24h: 0               # US API doesn't provide inline volume data
-  min_spread: 0.005           # 0.5% minimum — tight spreads are fine, we want fills
-  max_end_date_days: 30           # only near-term markets
-  include_slugs: []               # leave empty to let keyword matching handle it
-  include_keywords: []              # e.g. ["aec-nba-det-orl-2026-03-01"] — filter by market slug keywords
-  exclude_keywords: []            # nothing to exclude
+  min_spread: 0.005               # 0.5% minimum
+  max_end_date_days: 30           # End dates are ~2 weeks after game day on Polymarket US
+  include_slugs: []
+  include_keywords: ["aec-nba", "aec-nhl"]  # only NBA and NHL game-day markets
+  exclude_keywords: []
   exclude_slugs: []
+
+  # Thin-market targeting (NEW v4)
+  max_top_of_book_depth: 1000     # Skip markets where BBO has >1000 tokens (too competitive)
+  sticky_bonus: 1.0               # Hysteresis: active markets get +1.0 score bonus
 
 store:
   data_dir: "./data"
@@ -55,4 +72,4 @@ logging:
 dashboard:
   enabled: true
   port: 8080
-  allowed_origins: [] # optional allowlist, e.g. ["http://localhost:8080"]
+  allowed_origins: []

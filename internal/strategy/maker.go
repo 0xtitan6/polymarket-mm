@@ -36,6 +36,12 @@ import (
 // The engine provides this callback, backed by the store package.
 type PositionSaver func(marketID string, pos Position) error
 
+// midSample holds a single mid-price observation for realized volatility calculation.
+type midSample struct {
+	price float64
+	ts    time.Time
+}
+
 // Maker runs the Avellaneda-Stoikov strategy for a single market.
 // It maintains a map of its own active orders and reconciles them each tick.
 type Maker struct {
@@ -57,6 +63,9 @@ type Maker struct {
 
 	// Optional dashboard event channel
 	dashboardEvents chan<- api.DashboardEvent
+
+	// Mid-price history for realized vol calculation
+	midHistory []midSample
 
 	logger *slog.Logger
 }
@@ -96,13 +105,27 @@ func NewMaker(
 // tradeCh is accepted for interface compatibility but will never fire — the US
 // API WS layer returns a nil channel from TradeEvents(). Fill detection is
 // handled entirely via orderCh (EXECUTION_TYPE_FILL events).
-func (m *Maker) Run(ctx context.Context, tradeCh <-chan types.WSTradeEvent, orderCh <-chan types.WSOrderEvent) {
+func (m *Maker) Run(ctx context.Context, tradeCh <-chan types.WSTradeEvent, orderCh <-chan types.WSOrderEvent, bookCh ...<-chan struct{}) {
 	ticker := time.NewTicker(m.cfg.RefreshInterval)
 	defer ticker.Stop()
+
+	// Book update channel (event-driven requoting). Optional variadic param
+	// keeps backward compatibility with any callers that don't pass it.
+	var bookNotify <-chan struct{}
+	if len(bookCh) > 0 && bookCh[0] != nil {
+		bookNotify = bookCh[0]
+	}
+
+	// Debounce: after a book-triggered requote, ignore further book signals
+	// briefly to avoid hammering the API. 100ms is aggressive but safe —
+	// the rate limiter allows 40 orders/sec.
+	const bookDebounce = 100 * time.Millisecond
+	lastBookRequote := time.Time{}
 
 	m.logger.Info("strategy started",
 		"tick_size", m.marketInfo.TickSize,
 		"order_size", m.cfg.OrderSizeUSD,
+		"event_driven", bookNotify != nil,
 	)
 
 	for {
@@ -121,7 +144,16 @@ func (m *Maker) Run(ctx context.Context, tradeCh <-chan types.WSTradeEvent, orde
 		case order := <-orderCh:
 			m.handleOrderEvent(order)
 
+		case <-bookNotify:
+			// Book changed via WS — requote immediately (with debounce).
+			now := time.Now()
+			if now.Sub(lastBookRequote) >= bookDebounce {
+				lastBookRequote = now
+				m.quoteUpdate(ctx)
+			}
+
 		case <-ticker.C:
+			// Fallback timer — still fires to handle stale books and REST refresh.
 			m.quoteUpdate(ctx)
 		}
 	}
@@ -154,6 +186,17 @@ func (m *Maker) quoteUpdate(ctx context.Context) {
 	if !ok {
 		m.logger.Debug("no mid price available")
 		return
+	}
+
+	// Append current mid to history for realized vol computation.
+	// Keep a rolling window of VolLookbackFills*3 samples for sufficient data.
+	m.midHistory = append(m.midHistory, midSample{price: mid, ts: time.Now()})
+	maxHistory := m.cfg.VolLookbackFills * 3
+	if maxHistory < 90 {
+		maxHistory = 90 // sensible floor even if VolLookbackFills is very small
+	}
+	if len(m.midHistory) > maxHistory {
+		m.midHistory = m.midHistory[len(m.midHistory)-maxHistory:]
 	}
 
 	m.inventory.UpdateMarkToMarket(mid)
@@ -271,6 +314,33 @@ func (m *Maker) computeQuotes(mid, remainingBudget float64) (*types.QuotePair, e
 	optSpread := gamma*sigma*sigma*T + (2.0/gamma)*math.Log(1+gamma/k)
 	optSpread *= flowMultiplier // Widen spread when flow is toxic
 
+	// Step 2 (vol overlay): Scale spread up by realized volatility if it
+	// exceeds the base sigma. This makes the bot widen quotes during
+	// turbulent periods. The multiplier is capped by VolSpreadCeiling.
+	volLookback := m.cfg.VolLookbackFills
+	if volLookback < 2 {
+		volLookback = 2
+	}
+	rVol := m.realizedVol(volLookback)
+	volFloor := m.cfg.VolSpreadFloor
+	volCeiling := m.cfg.VolSpreadCeiling
+	if volFloor <= 0 {
+		volFloor = 1.0
+	}
+	if volCeiling <= 0 {
+		volCeiling = 3.0
+	}
+	if rVol > 0 && sigma > 0 && rVol > sigma {
+		volMultiplier := rVol / sigma
+		if volMultiplier < volFloor {
+			volMultiplier = volFloor
+		}
+		if volMultiplier > volCeiling {
+			volMultiplier = volCeiling
+		}
+		optSpread *= volMultiplier
+	}
+
 	// Step 2b: Clamp optimal spread to a sane range.
 	// The theoretical A-S spread can be absurdly wide (>100%) when γ is small
 	// relative to k. For prediction markets we cap at 30% or the actual book
@@ -303,7 +373,33 @@ func (m *Maker) computeQuotes(mid, remainingBudget float64) (*types.QuotePair, e
 		askRaw = reservationPrice + minSpread/2
 	}
 
-	// Step 4b: Liquidity reward targeting.
+	// Step 4b: BBO matching — if the book's top-of-book depth is thin enough,
+	// snap our quotes to the BBO price. This gives us queue priority at the
+	// best price level instead of quoting behind and never getting filled.
+	// Only match BBO if:
+	//   1. BBOMatchMaxDepth is configured (> 0)
+	//   2. The depth at the best bid/ask is below the threshold
+	//   3. The resulting spread still exceeds our minimum spread floor
+	if m.cfg.BBOMatchMaxDepth > 0 {
+		bboBid, bboAsk, bboBidDepth, bboAskDepth, bboOk := m.book.BestBidAskWithDepth()
+		if bboOk {
+			// Match bid to BBO if depth is thin
+			if bboBidDepth > 0 && bboBidDepth <= m.cfg.BBOMatchMaxDepth && bboBid > bidRaw {
+				// Only match if the resulting spread is still profitable
+				if (askRaw - bboBid) >= minSpread {
+					bidRaw = bboBid
+				}
+			}
+			// Match ask to BBO if depth is thin
+			if bboAskDepth > 0 && bboAskDepth <= m.cfg.BBOMatchMaxDepth && bboAsk < askRaw {
+				if (bboAsk - bidRaw) >= minSpread {
+					askRaw = bboAsk
+				}
+			}
+		}
+	}
+
+	// Step 4c: Liquidity reward targeting.
 	// If the market offers liquidity rewards (RewardsMaxSpread > 0), try to
 	// tighten the spread to qualify. Only tighten — never widen beyond what
 	// the model computed. This makes rewards the most reliable income source
@@ -338,18 +434,79 @@ func (m *Maker) computeQuotes(mid, remainingBudget float64) (*types.QuotePair, e
 		askPrice = bidPrice + tick
 	}
 
-	// Step 7: Compute size
+	// Step 7: Compute size using half-Kelly criterion.
+	//
+	// Edge = distance from our quote to mid, minus winner fees.
+	// Kelly fraction: f* = (edge/price) / odds, scaled by kellyFraction.
+	// For binary markets: odds ≈ (1/price) - 1.
+	// Size = kellyFraction * remainingBudget / price.
+	//
+	// If either side has edge below MinEdgeBps threshold, skip that side.
+	kellyFraction := m.cfg.KellyFraction
+	if kellyFraction <= 0 {
+		kellyFraction = 0.5
+	}
+	winnerFeePct := m.cfg.WinnerFeePct
+	if winnerFeePct <= 0 {
+		winnerFeePct = 0.02
+	}
+	minEdge := float64(m.cfg.MinEdgeBps) / 10000.0
+	if minEdge <= 0 {
+		minEdge = 0.005 // 50 bps default
+	}
+
+	// Inventory skew factor: more aggressive reduction (0.7 instead of 0.5)
 	absQ := math.Abs(q)
-	sizeFactor := 1.0 - 0.5*absQ // reduce size when heavily positioned
-	baseSize := m.cfg.OrderSizeUSD / mid
-	bidSize := math.Max(baseSize*sizeFactor, m.marketInfo.MinOrderSize)
-	askSize := math.Max(baseSize*sizeFactor, m.marketInfo.MinOrderSize)
+	sizeFactor := 1.0 - 0.7*absQ
+	if sizeFactor < 0 {
+		sizeFactor = 0
+	}
+
+	minOrderSize := m.marketInfo.MinOrderSize
+	if minOrderSize <= 0 {
+		minOrderSize = 1.0
+	}
+
+	// Bid side Kelly sizing
+	bidEdge := mid - bidPrice - (winnerFeePct * bidPrice)
+	var bidSize float64
+	if bidEdge >= minEdge && bidPrice > 0 {
+		bidOdds := (1.0/bidPrice) - 1.0
+		if bidOdds > 0 {
+			bidKelly := (bidEdge / bidPrice) / bidOdds * kellyFraction
+			bidKelly *= sizeFactor
+			bidSize = math.Max(bidKelly*remainingBudget/bidPrice, minOrderSize)
+		}
+	} else {
+		// Edge below threshold — skip bid
+		bidSize = 0
+	}
+
+	// Ask side Kelly sizing
+	askEdge := askPrice - mid - (winnerFeePct * askPrice)
+	var askSize float64
+	if askEdge >= minEdge && askPrice > 0 {
+		askOdds := (1.0/askPrice) - 1.0
+		if askOdds > 0 {
+			askKelly := (askEdge / askPrice) / askOdds * kellyFraction
+			askKelly *= sizeFactor
+			askSize = math.Max(askKelly*remainingBudget/askPrice, minOrderSize)
+		}
+	} else {
+		// Edge below threshold — skip ask
+		askSize = 0
+	}
 
 	// Step 7b: If liquidity rewards are active, ensure order sizes meet the
 	// rewards minimum. This is often the most reliable income source.
+	// Only apply if the side wasn't already skipped due to insufficient edge.
 	if m.marketInfo.RewardsMinSize > 0 {
-		bidSize = math.Max(bidSize, m.marketInfo.RewardsMinSize)
-		askSize = math.Max(askSize, m.marketInfo.RewardsMinSize)
+		if bidSize > 0 {
+			bidSize = math.Max(bidSize, m.marketInfo.RewardsMinSize)
+		}
+		if askSize > 0 {
+			askSize = math.Max(askSize, m.marketInfo.RewardsMinSize)
+		}
 	}
 
 	// Limit by remaining risk budget
@@ -365,10 +522,11 @@ func (m *Maker) computeQuotes(mid, remainingBudget float64) (*types.QuotePair, e
 		askSize *= scale
 	}
 
-	// Floor to min order size
+	// Floor to min order size — API requires quantity > 0
 	var bid, ask *types.UserOrder
+	minSizeFloor := math.Max(m.marketInfo.MinOrderSize, 1.0) // At least 1 token
 
-	if bidSize >= m.marketInfo.MinOrderSize && bidPrice > 0 && bidPrice < 1 {
+	if bidSize >= minSizeFloor && bidPrice > 0 && bidPrice < 1 {
 		bid = &types.UserOrder{
 			// TokenID carries the market slug (YesTokenID = Slug after scanner migration).
 			// The exchange shim reads this as MarketSlug for POST /v1/orders.
@@ -382,7 +540,7 @@ func (m *Maker) computeQuotes(mid, remainingBudget float64) (*types.QuotePair, e
 		}
 	}
 
-	if askSize >= m.marketInfo.MinOrderSize && askPrice > 0 && askPrice < 1 {
+	if askSize >= minSizeFloor && askPrice > 0 && askPrice < 1 {
 		ask = &types.UserOrder{
 			// TokenID carries the market slug (YesTokenID = Slug after scanner migration).
 			// Side SELL is translated to ORDER_INTENT_SELL_LONG by the shim.
@@ -409,6 +567,7 @@ func (m *Maker) computeQuotes(mid, remainingBudget float64) (*types.QuotePair, e
 		"spread", askPrice-bidPrice,
 		"prob_factor", probFactor,
 		"dynamic_sigma", sigma,
+		"realized_vol", rVol,
 		"toxicity_score", toxicity.ToxicityScore,
 		"directional_imbalance", toxicity.DirectionalImbalance,
 		"fill_velocity", toxicity.FillVelocity,
@@ -472,69 +631,95 @@ func (m *Maker) reconcileOrders(ctx context.Context, desired *types.QuotePair) e
 		toPlace = append(toPlace, *desired.Ask)
 	}
 
-	// Cancel stale orders via the bulk cancel endpoint (POST /v1/orders/open/cancel).
-	// The individual DELETE /v1/order/{id}/cancel endpoint returns HTTP 501 on the
-	// US API, so we always use the bulk method which cancels all open orders for
-	// the given market slug. This also clears any orders we lost track of.
+	// Nothing to do — quotes match existing orders.
+	if len(toCancel) == 0 && len(toPlace) == 0 {
+		return nil
+	}
+
+	// Fire cancel and place CONCURRENTLY for minimum latency.
+	// The cancel uses bulk cancel (all orders for this market slug).
+	// New orders are placed in parallel via PostOrders.
+	// Both hit different API endpoints so there's no conflict.
+
+	type cancelResult struct {
+		resp *types.CancelResponse
+		err  error
+	}
+	type placeResult struct {
+		results []types.OrderResponse
+		err     error
+	}
+
+	cancelCh := make(chan cancelResult, 1)
+	placeCh := make(chan placeResult, 1)
+
+	// Fire cancel in background
 	if len(toCancel) > 0 {
-		resp, err := m.client.CancelMarketOrders(ctx, m.marketInfo.Slug)
-		if err != nil {
-			m.logger.Warn("bulk cancel failed, evicting stale order IDs", "error", err, "count", len(toCancel))
-			// Evict the stale IDs from tracking to prevent infinite retry loops.
-			// If cancel truly failed, the next tick will re-detect them via
-			// reconciliation and try again.
-			for _, id := range toCancel {
-				delete(m.activeOrders, id)
-			}
-		} else {
-			// Remove all cancelled order IDs from tracking
-			for _, id := range resp.Canceled {
-				delete(m.activeOrders, id)
-			}
-			// Also evict the IDs we intended to cancel, in case the server
-			// cancelled them but returned different IDs (e.g. exchange-assigned vs local)
-			for _, id := range toCancel {
-				delete(m.activeOrders, id)
-			}
+		go func() {
+			resp, err := m.client.CancelMarketOrders(ctx, m.marketInfo.Slug)
+			cancelCh <- cancelResult{resp, err}
+		}()
+	} else {
+		cancelCh <- cancelResult{nil, nil}
+	}
+
+	// Fire place in background simultaneously
+	if len(toPlace) > 0 {
+		go func() {
+			results, err := m.client.PostOrders(ctx, toPlace, m.marketInfo.NegRisk)
+			placeCh <- placeResult{results, err}
+		}()
+	} else {
+		placeCh <- placeResult{nil, nil}
+	}
+
+	// Collect cancel result
+	cr := <-cancelCh
+	if cr.err != nil {
+		m.logger.Warn("bulk cancel failed, evicting stale order IDs", "error", cr.err, "count", len(toCancel))
+		for _, id := range toCancel {
+			delete(m.activeOrders, id)
+		}
+	} else if cr.resp != nil {
+		for _, id := range cr.resp.Canceled {
+			delete(m.activeOrders, id)
+		}
+		for _, id := range toCancel {
+			delete(m.activeOrders, id)
 		}
 	}
 
-	// Place new orders
-	if len(toPlace) > 0 {
-		results, err := m.client.PostOrders(ctx, toPlace, m.marketInfo.NegRisk)
-		if err != nil {
-			return fmt.Errorf("place orders: %w", err)
-		}
-		for i, result := range results {
-			if result.Success && result.OrderID != "" {
-				// Compute total filled quantity from instant executions.
-				var cumFilled float64
-				for _, exec := range result.Executions {
-					eQty, _ := strconv.ParseFloat(exec.Quantity, 64)
-					cumFilled += eQty
-				}
-				m.activeOrders[result.OrderID] = types.OpenOrder{
-					ID:           result.OrderID,
-					Status:       result.Status,
-					Market:       m.marketInfo.ConditionID,
-					AssetID:      toPlace[i].TokenID,
-					Side:         string(toPlace[i].Side),
-					Price:        fmt.Sprintf("%.4f", toPlace[i].Price),
-					OriginalSize: fmt.Sprintf("%.2f", toPlace[i].Size),
-					SizeMatched:  fmt.Sprintf("%.6f", cumFilled),
-				}
-				// Process instant fills that happened at placement time.
-				// These would otherwise be missed if the WS is disconnected.
-				for _, exec := range result.Executions {
-					m.processInstantFill(result.OrderID, toPlace[i], exec)
-				}
-			} else if result.ErrorMsg != "" {
-				m.logger.Error("order rejected",
-					"error", result.ErrorMsg,
-					"side", toPlace[i].Side,
-					"price", toPlace[i].Price,
-				)
+	// Collect place result
+	pr := <-placeCh
+	if pr.err != nil {
+		return fmt.Errorf("place orders: %w", pr.err)
+	}
+	for i, result := range pr.results {
+		if result.Success && result.OrderID != "" {
+			var cumFilled float64
+			for _, exec := range result.Executions {
+				eQty, _ := strconv.ParseFloat(exec.Quantity, 64)
+				cumFilled += eQty
 			}
+			m.activeOrders[result.OrderID] = types.OpenOrder{
+				ID:           result.OrderID,
+				Status:       result.Status,
+				Market:       m.marketInfo.ConditionID,
+				AssetID:      toPlace[i].TokenID,
+				Side:         string(toPlace[i].Side),
+				Price:        fmt.Sprintf("%.4f", toPlace[i].Price),
+				OriginalSize: fmt.Sprintf("%.2f", toPlace[i].Size),
+				SizeMatched:  fmt.Sprintf("%.6f", cumFilled),
+			}
+			for _, exec := range result.Executions {
+				m.processInstantFill(result.OrderID, toPlace[i], exec)
+			}
+		} else if result.ErrorMsg != "" {
+			m.logger.Error("order rejected",
+				"error", result.ErrorMsg,
+				"side", toPlace[i].Side,
+				"price", toPlace[i].Price,
+			)
 		}
 	}
 
@@ -635,12 +820,10 @@ func (m *Maker) handleFillFromOrder(event types.WSOrderEvent) {
 		fillSize = cumQty
 	}
 	if fillSize <= 0 {
-		// Fallback: treat cumQty as the fill size if the delta is non-positive.
-		// This can happen on the first event for a partially-filled resting order.
-		fillSize = cumQty
-	}
-	if fillSize <= 0 {
-		return // Nothing to process
+		// Delta is zero or negative — this is a duplicate WS event delivering
+		// the same cumQty we already processed. Return instead of using the
+		// old fallback (which would re-add cumQty and double-count).
+		return
 	}
 
 	// Normalize the side string. The US API WS private feed may send
@@ -911,6 +1094,46 @@ func isSellSide(s string) bool {
 // ————————————————————————————————————————————————————————————————————————
 // Math helpers
 // ————————————————————————————————————————————————————————————————————————
+
+// realizedVol computes the standard deviation of log-returns from the
+// most recent n midHistory samples. Returns 0 if insufficient data.
+func (m *Maker) realizedVol(n int) float64 {
+	if n < 2 {
+		n = 2
+	}
+	hist := m.midHistory
+	if len(hist) < 2 {
+		return 0
+	}
+	// Use at most the last n samples
+	if len(hist) > n {
+		hist = hist[len(hist)-n:]
+	}
+	// Compute log-returns
+	returns := make([]float64, 0, len(hist)-1)
+	for i := 1; i < len(hist); i++ {
+		if hist[i-1].price <= 0 || hist[i].price <= 0 {
+			continue
+		}
+		returns = append(returns, math.Log(hist[i].price/hist[i-1].price))
+	}
+	if len(returns) < 2 {
+		return 0
+	}
+	// Mean
+	var sum float64
+	for _, r := range returns {
+		sum += r
+	}
+	mean := sum / float64(len(returns))
+	// Variance
+	var varSum float64
+	for _, r := range returns {
+		d := r - mean
+		varSum += d * d
+	}
+	return math.Sqrt(varSum / float64(len(returns)-1))
+}
 
 func clamp(v, lo, hi float64) float64 {
 	if v < lo {

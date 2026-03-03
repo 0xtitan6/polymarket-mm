@@ -80,6 +80,21 @@ type StrategyConfig struct {
 	FlowToxicityThreshold   float64       `mapstructure:"flow_toxicity_threshold"`
 	FlowCooldownPeriod      time.Duration `mapstructure:"flow_cooldown_period"`
 	FlowMaxSpreadMultiplier float64       `mapstructure:"flow_max_spread_multiplier"`
+
+	// Half-Kelly position sizing
+	KellyFraction float64 `mapstructure:"kelly_fraction"`   // Kelly multiplier (0.5 = half-Kelly)
+	MinEdgeBps    int     `mapstructure:"min_edge_bps"`     // Minimum edge in bps to trade (filters noise)
+	WinnerFeePct  float64 `mapstructure:"winner_fee_pct"`   // Polymarket winner fee (e.g., 0.02 = 2%)
+
+	// Volatility-aware spread
+	VolLookbackFills int     `mapstructure:"vol_lookback_fills"` // Number of recent price samples for realized vol
+	VolSpreadFloor   float64 `mapstructure:"vol_spread_floor"`   // Minimum vol-based spread multiplier (1.0 = no effect)
+	VolSpreadCeiling float64 `mapstructure:"vol_spread_ceiling"` // Maximum vol-based spread multiplier
+
+	// BBO matching: when the best bid/ask has fewer than this many tokens,
+	// quote AT the BBO price to get queue priority. 0 = always use A-S model.
+	// Recommended: 100-500 tokens for small accounts.
+	BBOMatchMaxDepth float64 `mapstructure:"bbo_match_max_depth"`
 }
 
 // RiskConfig sets hard limits that trigger order cancellation (kill switch).
@@ -102,10 +117,18 @@ type RiskConfig struct {
 }
 
 // ScannerConfig controls how the bot discovers and filters tradeable markets.
-// The scanner polls the Markets API and ranks markets by opportunity score:
-// score = spread * sqrt(volume24h) * min(liquidity/10000, 1).
-// IncludeSlugs/IncludeKeywords can constrain discovery to a specific market set.
-// ExcludeKeywords can further remove noisy sub-families.
+// The scanner polls the Markets API and ranks markets by opportunity score.
+//
+// Scoring: score = spread / (avgDepth + 1). Thinner books = higher score.
+// This lets our small orders sit near the top of the book instead of behind
+// thousands of tokens from whales.
+//
+// Hysteresis: markets currently being traded get a StickyBonus boost to their
+// score, preventing the scanner from rotating away too quickly. Combined with
+// a longer PollInterval, this keeps the bot on profitable markets.
+//
+// Depth filter: MaxTopOfBookDepth filters out markets where the best bid/ask
+// has more tokens than we can realistically compete with.
 type ScannerConfig struct {
 	PollInterval        time.Duration `mapstructure:"poll_interval"`
 	MinLiquidity        float64       `mapstructure:"min_liquidity"`
@@ -117,6 +140,14 @@ type ScannerConfig struct {
 	IncludeKeywords     []string      `mapstructure:"include_keywords"`
 	ExcludeKeywords     []string      `mapstructure:"exclude_keywords"`
 	ExcludeSlugs        []string      `mapstructure:"exclude_slugs"`
+
+	// Thin-market targeting: skip markets where top-of-book depth exceeds this.
+	// 0 = no filter (disabled). Recommended: 500-2000 tokens.
+	MaxTopOfBookDepth int `mapstructure:"max_top_of_book_depth"`
+
+	// Hysteresis: bonus score for markets the bot is currently trading.
+	// Prevents premature rotation. 0 = no bonus. Recommended: 0.5-2.0.
+	StickyBonus float64 `mapstructure:"sticky_bonus"`
 }
 
 // StoreConfig sets where position data is persisted (JSON files).
@@ -153,6 +184,8 @@ func Load(path string) (*Config, error) {
 	if err := v.Unmarshal(&cfg); err != nil {
 		return nil, fmt.Errorf("unmarshal config: %w", err)
 	}
+
+	cfg.SetDefaults()
 
 	// Override sensitive auth fields from env
 	if key := os.Getenv("POLY_API_KEY_ID"); key != "" {
@@ -195,4 +228,27 @@ func (c *Config) Validate() error {
 		return fmt.Errorf("risk.max_markets_active must be > 0")
 	}
 	return nil
+}
+
+// SetDefaults fills in zero-valued new EV-strategy fields with sensible defaults.
+// Called automatically by Load() after Unmarshal.
+func (c *Config) SetDefaults() {
+	if c.Strategy.KellyFraction == 0 {
+		c.Strategy.KellyFraction = 0.5
+	}
+	if c.Strategy.WinnerFeePct == 0 {
+		c.Strategy.WinnerFeePct = 0.02
+	}
+	if c.Strategy.VolLookbackFills == 0 {
+		c.Strategy.VolLookbackFills = 30
+	}
+	if c.Strategy.VolSpreadFloor == 0 {
+		c.Strategy.VolSpreadFloor = 1.0
+	}
+	if c.Strategy.VolSpreadCeiling == 0 {
+		c.Strategy.VolSpreadCeiling = 3.0
+	}
+	if c.Strategy.MinEdgeBps == 0 {
+		c.Strategy.MinEdgeBps = 50
+	}
 }

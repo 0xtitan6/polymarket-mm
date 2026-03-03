@@ -42,6 +42,7 @@ type marketSlot struct {
 	cancel    context.CancelFunc
 	tradeCh   chan types.WSTradeEvent
 	orderCh   chan types.WSOrderEvent
+	bookCh    chan struct{} // notifies maker of WS book updates for event-driven requoting
 }
 
 // Engine orchestrates all components of the market-making system.
@@ -270,6 +271,14 @@ func (e *Engine) reconcileMarkets(result market.ScanResult) {
 			e.startMarketLocked(alloc)
 		}
 	}
+
+	// Update scanner's active slug set for hysteresis scoring.
+	// Next scan will give these markets a sticky bonus.
+	activeSlugs := make([]string, 0, len(e.slots))
+	for slug := range e.slots {
+		activeSlugs = append(activeSlugs, slug)
+	}
+	e.scanner.SetActiveSlugs(activeSlugs)
 }
 
 func (e *Engine) startMarketLocked(alloc types.MarketAllocation) {
@@ -327,6 +336,7 @@ func (e *Engine) startMarketLocked(alloc types.MarketAllocation) {
 		cancel:    cancel,
 		tradeCh:   tradeCh,
 		orderCh:   orderCh,
+		bookCh:    make(chan struct{}, 16), // buffered to avoid blocking WS dispatch
 	}
 
 	e.slots[slug] = slot
@@ -353,7 +363,7 @@ func (e *Engine) startMarketLocked(alloc types.MarketAllocation) {
 	e.wg.Add(1)
 	go func() {
 		defer e.wg.Done()
-		maker.Run(ctx, tradeCh, orderCh)
+		maker.Run(ctx, tradeCh, orderCh, slot.bookCh)
 	}()
 
 	e.logger.Info("market started",
@@ -460,6 +470,14 @@ func (e *Engine) routeBookEvent(evt types.WSBookEvent) {
 	}
 
 	slot.book.ApplyBookEvent(evt)
+
+	// Notify the maker that the book changed so it can requote immediately.
+	// Non-blocking send: if the channel is full the maker will catch up on
+	// the next signal or the fallback timer tick.
+	select {
+	case slot.bookCh <- struct{}{}:
+	default:
+	}
 }
 
 // dispatchUserEvents routes WS private events to the correct slot's channels.
