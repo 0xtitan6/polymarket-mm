@@ -17,10 +17,15 @@ import (
 
 // Scanner periodically polls the Polymarket US API to discover the best
 // market-making opportunities. It fetches active markets, applies keyword/slug
-// filters, fetches BBO for each candidate, and ranks by spread.
+// filters, fetches BBO for each candidate, and ranks by opportunity score.
 //
-// Since the US market list endpoint does not include inline BBO or volume data,
-// the scanner fetches BBO for each filtered market to compute spreads.
+// Scoring (v2): score = spread / (avgDepth + 1)
+// Markets with thinner books and wider spreads rank highest — these are where
+// small orders (1-5 tokens) can realistically sit near the top of the book.
+//
+// Hysteresis: currently-traded markets receive a StickyBonus to prevent the
+// scanner from rotating away prematurely. This keeps the bot on markets longer,
+// reducing cancel/replace churn and giving orders time to fill.
 
 // ScanResult contains markets ranked by opportunity quality.
 type ScanResult struct {
@@ -35,22 +40,46 @@ type Scanner struct {
 	riskCfg config.RiskConfig   // MaxMarketsActive, MaxPositionPerMarket
 	logger  *slog.Logger
 	resultCh chan ScanResult // engine reads selected markets from here
+
+	// activeSlugs tracks which markets the engine is currently trading.
+	// Used for hysteresis scoring (sticky markets get a bonus).
+	activeSlugs   map[string]bool
+	activeSlugsMu sync.RWMutex
 }
 
 // NewScanner creates a market scanner backed by the given exchange client.
 func NewScanner(client *exchange.Client, cfg config.Config, logger *slog.Logger) *Scanner {
 	return &Scanner{
-		client:   client,
-		cfg:      cfg.Scanner,
-		riskCfg:  cfg.Risk,
-		logger:   logger.With("component", "scanner"),
-		resultCh: make(chan ScanResult, 1),
+		client:      client,
+		cfg:         cfg.Scanner,
+		riskCfg:     cfg.Risk,
+		logger:      logger.With("component", "scanner"),
+		resultCh:    make(chan ScanResult, 1),
+		activeSlugs: make(map[string]bool),
 	}
 }
 
 // Results returns the channel the engine reads from.
 func (s *Scanner) Results() <-chan ScanResult {
 	return s.resultCh
+}
+
+// SetActiveSlugs updates the set of currently-traded markets for hysteresis.
+// Called by the engine after reconciling markets.
+func (s *Scanner) SetActiveSlugs(slugs []string) {
+	s.activeSlugsMu.Lock()
+	defer s.activeSlugsMu.Unlock()
+	s.activeSlugs = make(map[string]bool, len(slugs))
+	for _, slug := range slugs {
+		s.activeSlugs[slug] = true
+	}
+}
+
+// isActiveSlug returns true if the slug is currently being traded.
+func (s *Scanner) isActiveSlug(slug string) bool {
+	s.activeSlugsMu.RLock()
+	defer s.activeSlugsMu.RUnlock()
+	return s.activeSlugs[slug]
 }
 
 // Run starts the polling loop. Blocks until ctx is cancelled.
@@ -80,7 +109,7 @@ func (s *Scanner) scan(ctx context.Context) {
 
 	filtered := s.filterMarkets(markets)
 
-	// Fetch BBO for each filtered market to get spread/pricing data
+	// Fetch BBO for each filtered market to get spread/depth data
 	ranked := s.rankWithBBO(ctx, filtered)
 
 	// Cap to max active markets
@@ -238,15 +267,19 @@ func (s *Scanner) filterMarkets(markets []types.USMarket) []types.USMarket {
 	return result
 }
 
-// rankWithBBO fetches BBO for each filtered market concurrently and ranks by spread.
-// score = spread × bidDepth × askDepth (markets with wider spreads and deeper
-// books are better MM opportunities).
+// rankWithBBO fetches BBO for each filtered market concurrently and ranks
+// using inverse depth scoring:
 //
-// To avoid spending 40+ seconds on sequential HTTP calls when 200+ markets
-// match the keyword filter, we:
-//   1. Cap the number of BBO fetches to maxBBOFetches (e.g. 30).
-//   2. Use a bounded worker pool (10 goroutines) for concurrency.
-//   3. Apply a per-scan timeout (30s) so we never block the engine.
+//	score = spread / (avgDepth + 1)
+//
+// Markets with wider spreads and THINNER books rank highest. This is the
+// opposite of the old scoring (spread * depth) which favored whale-dominated
+// markets where our 1-token orders were invisible.
+//
+// Additionally:
+//   - MaxTopOfBookDepth filter removes markets where BBO depth exceeds the
+//     configured threshold (too competitive for small accounts).
+//   - StickyBonus gives currently-traded markets a score boost (hysteresis).
 func (s *Scanner) rankWithBBO(ctx context.Context, markets []types.USMarket) []types.MarketAllocation {
 	const (
 		maxBBOFetches = 30 // don't BBO-check more than this many markets
@@ -254,9 +287,7 @@ func (s *Scanner) rankWithBBO(ctx context.Context, markets []types.USMarket) []t
 		scanTimeout   = 30 * time.Second
 	)
 
-	// Cap the candidates — prefer diversity: take a random-ish sample
-	// by just truncating (they're already in API order which is effectively
-	// random across market families).
+	// Cap the candidates
 	candidates := markets
 	if len(candidates) > maxBBOFetches {
 		s.logger.Info("capping BBO fetches", "total_filtered", len(candidates), "cap", maxBBOFetches)
@@ -264,11 +295,13 @@ func (s *Scanner) rankWithBBO(ctx context.Context, markets []types.USMarket) []t
 	}
 
 	type scored struct {
-		market  types.USMarket
-		bestBid float64
-		bestAsk float64
-		spread  float64
-		score   float64
+		market   types.USMarket
+		bestBid  float64
+		bestAsk  float64
+		spread   float64
+		bidDepth int
+		askDepth int
+		score    float64
 	}
 
 	scanCtx, scanCancel := context.WithTimeout(ctx, scanTimeout)
@@ -283,6 +316,8 @@ func (s *Scanner) rankWithBBO(ctx context.Context, markets []types.USMarket) []t
 
 	// Fan-in: collect results
 	resultCh := make(chan scored, len(candidates))
+
+	maxDepth := s.cfg.MaxTopOfBookDepth
 
 	var wg sync.WaitGroup
 	for i := 0; i < workerCount && i < len(candidates); i++ {
@@ -310,17 +345,43 @@ func (s *Scanner) rankWithBBO(ctx context.Context, markets []types.USMarket) []t
 					continue
 				}
 
-				depthFactor := float64(bbo.MarketData.BidDepth+bbo.MarketData.AskDepth) / 2.0
-				if depthFactor < 1 {
-					depthFactor = 1
+				bidDepth := bbo.MarketData.BidDepth
+				askDepth := bbo.MarketData.AskDepth
+
+				// Task 5: Filter out markets where top-of-book is too deep
+				// (we can't compete with thousands of tokens ahead of us)
+				if maxDepth > 0 {
+					if bidDepth > maxDepth || askDepth > maxDepth {
+						s.logger.Debug("skipping deep market",
+							"slug", m.Slug,
+							"bid_depth", bidDepth,
+							"ask_depth", askDepth,
+							"max", maxDepth,
+						)
+						continue
+					}
+				}
+
+				// Task 1: Inverse depth scoring — thinner books = higher score
+				// score = spread / (avgDepth + 1)
+				// Adding 1 prevents division by zero and makes the score
+				// proportional to spread when depth is near zero.
+				avgDepth := float64(bidDepth+askDepth) / 2.0
+				score := spread / (avgDepth + 1.0)
+
+				// Task 4: Hysteresis — currently-traded markets get a bonus
+				if s.isActiveSlug(m.Slug) && s.cfg.StickyBonus > 0 {
+					score += s.cfg.StickyBonus
 				}
 
 				resultCh <- scored{
-					market:  m,
-					bestBid: bid,
-					bestAsk: ask,
-					spread:  spread,
-					score:   spread * depthFactor,
+					market:   m,
+					bestBid:  bid,
+					bestAsk:  ask,
+					spread:   spread,
+					bidDepth: bidDepth,
+					askDepth: askDepth,
+					score:    score,
 				}
 			}
 		}()
@@ -348,6 +409,16 @@ func (s *Scanner) rankWithBBO(ctx context.Context, markets []types.USMarket) []t
 			MaxPositionUSD: s.riskCfg.MaxPositionPerMarket,
 			Score:          sm.score,
 		}
+
+		s.logger.Debug("ranked market",
+			"rank", i+1,
+			"slug", sm.market.Slug,
+			"spread", sm.spread,
+			"bid_depth", sm.bidDepth,
+			"ask_depth", sm.askDepth,
+			"score", sm.score,
+			"sticky", s.isActiveSlug(sm.market.Slug),
+		)
 	}
 
 	return result

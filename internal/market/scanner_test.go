@@ -42,8 +42,9 @@ func baseMarket() types.USMarket {
 
 func newTestScanner() *Scanner {
 	return &Scanner{
-		cfg:     testScannerConfig(),
-		riskCfg: testRiskConfig(),
+		cfg:         testScannerConfig(),
+		riskCfg:     testRiskConfig(),
+		activeSlugs: make(map[string]bool),
 	}
 }
 
