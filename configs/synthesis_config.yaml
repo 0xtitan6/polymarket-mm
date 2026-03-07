@@ -1,0 +1,104 @@
+# Synthesis Trade API — Market Maker Configuration
+#
+# This config file targets the Synthesis Trade API (https://synthesis.trade)
+# instead of the Polymarket US API. It is loaded by cmd/synthesis-bot/main.go
+# using config.LoadSynthesis().
+#
+# Auth is simple: one API key + wallet ID (no Ed25519 keys required).
+# Strategy, risk, and scanner parameters are identical to the Polymarket config.
+#
+# Required environment variables:
+#   SYNTH_API_KEY    — your Synthesis API key (never commit this)
+#   SYNTH_WALLET_ID  — your Synthesis wallet ID
+#
+# Optional:
+#   SYNTH_DRY_RUN=true  — enable dry-run mode at runtime
+
+dry_run: true  # Safety default — set to false (or SYNTH_DRY_RUN=false) for live trading
+
+auth:
+  # api_key: ""        # Set via SYNTH_API_KEY env — DO NOT commit plaintext key
+  # wallet_id: ""      # Set via SYNTH_WALLET_ID env — DO NOT commit wallet ID
+  api_key: ""          # overridden by SYNTH_API_KEY at runtime
+  wallet_id: ""        # overridden by SYNTH_WALLET_ID at runtime
+  venue: "pol"         # "pol" = Polymarket, "sol" = Kalshi
+
+api:
+  base_url: "https://synthesis.trade/api/v1"
+  # Polymarket public CLOB API — used for reading order books and prices.
+  # No authentication needed. Leave empty to use the default.
+  poly_clob_base_url: "https://clob.polymarket.com"
+  # WebSocket URLs are not used by the Synthesis bot — it polls REST endpoints
+  # instead. These fields are kept for structural parity with config.yaml.
+  ws_market_url: ""
+  ws_private_url: ""
+
+strategy:
+  gamma: 0.40               # Risk aversion parameter — higher = tighter spread control
+  sigma: 0.6                # Estimated price volatility (annualized)
+  k: 1.5                    # Order arrival intensity
+  t: 0.00137                # Time horizon (~0.5 day)
+  default_spread_bps: 300   # Minimum spread floor in basis points (must clear fees)
+  order_size_usd: 1.0       # Target notional size per order in USD
+  refresh_interval: 2s      # Synthesis uses REST polling; 2s matches the book poll interval
+  stale_book_timeout: 90s   # Cancel orders if no book update within this window
+
+  # Half-Kelly position sizing
+  kelly_fraction: 0.5       # Half-Kelly — conservative for noisy edge estimates
+  min_edge_bps: 50          # Skip quotes with less than 50bps edge
+  winner_fee_pct: 0.02      # Exchange winner fee (2%) — deducted from edge calculation
+
+  # Volatility-aware spread
+  vol_lookback_fills: 30    # Use last 30 mid-price samples for realized vol estimate
+  vol_spread_floor: 1.0     # Minimum vol multiplier
+  vol_spread_ceiling: 3.0   # Maximum 3x spread widening during high vol
+
+  # BBO matching
+  bbo_match_max_depth: 200  # Match BBO when top-of-book depth < 200 tokens
+
+  # Toxic flow detection
+  flow_window: 60s
+  flow_toxicity_threshold: 0.5
+  flow_cooldown_period: 120s
+  flow_max_spread_multiplier: 2.5
+
+risk:
+  max_position_per_market: 1.0   # Max USD exposure per market
+  max_global_exposure: 2.00      # Max combined USD exposure
+  max_markets_active: 3          # Maximum concurrent markets
+  kill_switch_drop_pct: 0.30     # 30% price move triggers kill switch
+  kill_switch_window_sec: 60
+  max_daily_loss: 0.50           # Hard daily loss limit in USD
+  cooldown_after_kill: 10m
+
+scanner:
+  poll_interval: 180s            # How often to scan for markets
+  min_liquidity: 0               # Liquidity data available via Polymarket CLOB
+  min_volume_24h: 0              # Volume data available via Polymarket CLOB
+  min_spread: 0.005              # 0.5% minimum spread for auto-discovered markets
+  max_end_date_days: 30          # Not used — no market metadata available
+
+  # IMPORTANT: Synthesis has no /markets endpoint for market discovery.
+  # Specify Polymarket token_ids here to tell the bot which markets to make.
+  # If empty, the bot derives markets from existing open orders & positions.
+  # BBO and order book data comes from the Polymarket public CLOB API.
+  include_slugs:                  # Polymarket token_ids to make markets on
+    - "54533043819946592547517511176940999955633860128497669742211153063842200957669"  # Newsom 2028 Dem Nom (Yes)
+
+  include_keywords: []           # Filter on token_id substring
+  exclude_keywords: []
+  exclude_slugs: []              # Blacklist specific token_ids
+  max_top_of_book_depth: 1000    # Available via Polymarket CLOB
+  sticky_bonus: 1.0              # Hysteresis bonus for currently-traded markets
+
+store:
+  data_dir: "./data/synthesis"   # Separate data dir from Polymarket to avoid conflicts
+
+logging:
+  level: "info"
+  format: "json"
+
+dashboard:
+  enabled: true
+  port: 8081                     # Different port from Polymarket bot (8080) for co-location
+  allowed_origins: []

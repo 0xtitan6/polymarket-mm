@@ -47,6 +47,12 @@ type APIConfig struct {
 	// GammaBaseURL is retained for the market scanner which may still poll
 	// the Polymarket Gamma metadata API for market discovery.
 	GammaBaseURL string `mapstructure:"gamma_base_url"`
+
+	// PolyCLOBBaseURL is the base URL for the Polymarket public CLOB API.
+	// Used by the Synthesis bot to read public market data (order books,
+	// midpoints, prices) while routing orders through Synthesis.
+	// Defaults to "https://clob.polymarket.com" if empty.
+	PolyCLOBBaseURL string `mapstructure:"poly_clob_base_url"`
 }
 
 // StrategyConfig tunes the Avellaneda-Stoikov market-making algorithm.

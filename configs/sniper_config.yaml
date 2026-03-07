@@ -1,0 +1,34 @@
+# Sniper Bot — CONSERVATIVE LIVE CONFIG
+# Past losses: $144 from paying 78-90c on coin-flip markets
+# Rule 1: NEVER pay more than 60c (hard cap in strategy.go)
+# Rule 2: $5 per bet (Synthesis minimum) — that's it, no stacking
+# Rule 3: Only 1 bet at a time — protect the bankroll
+# Rule 4: Only bet on clear directional moves
+
+dry_run: false  # LIVE TRADING
+
+auth:
+  api_key: ""
+  wallet_id: ""
+  venue: "pol"
+
+api:
+  base_url: "https://synthesis.trade/api/v1"
+
+price_feed:
+  poll_interval_ms: 500
+  assets: [BTC, ETH, SOL, XRP]
+
+strategy:
+  earliest_entry_seconds: 180  # 3 min in — enough data to see direction
+  latest_entry_seconds: 270    # 4:30 in — 30s buffer before close
+  min_edge_pct: 0.0005         # 0.05% = 5bps — need real signal
+  strong_edge_pct: 0.002       # 0.2% = 20bps — high confidence
+  order_size_usd: 5.00         # $5 per bet — Synthesis minimum, our max
+  max_position_usd: 5.00       # Max $5 total — ONE bet at a time
+  max_concurrent: 1            # Strictly 1 position — no stacking
+  aggressive_bid_offset: 0.03  # 3c below fair value — conservative
+
+logging:
+  level: "info"
+  format: "text"
