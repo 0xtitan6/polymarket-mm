@@ -20,7 +20,7 @@ price_feed:
   assets: [BTC, ETH, SOL, XRP]
 
 strategy:
-  earliest_entry_seconds: 180  # 3 min in — enough data to see direction
+  earliest_entry_seconds: 120  # 2 min in — earlier entry to beat sandbox freezes
   latest_entry_seconds: 270    # 4:30 in — 30s buffer before close
   min_edge_pct: 0.0005         # 0.05% = 5bps — need real signal
   strong_edge_pct: 0.002       # 0.2% = 20bps — high confidence

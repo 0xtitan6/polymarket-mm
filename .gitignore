@@ -38,3 +38,6 @@ bot.log
 # OS files
 .DS_Store
 Thumbs.db
+/sniper
+/synthesis-bot
+/sniper_bin

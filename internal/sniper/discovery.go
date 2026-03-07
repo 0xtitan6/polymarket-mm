@@ -206,6 +206,7 @@ func (d *MarketDiscovery) fetchMarket(ctx context.Context, asset pricefeed.Asset
 	if err != nil {
 		return nil, err
 	}
+	req.Header.Set("User-Agent", "Mozilla/5.0 (compatible; polymarket-sniper/1.0)")
 
 	resp, err := d.httpClient.Do(req)
 	if err != nil {
